@@ -180,6 +180,9 @@ hash_add_inline_plain(struct hash_table *ht, const uint8_t *data, size_t size)
 static nserror
 hash_add_inline_gzip(struct hash_table *ht, const uint8_t *data, size_t size)
 {
+#ifdef WITHOUT_ZLIB
+	return NSERROR_NOT_IMPLEMENTED;
+#else
 	nserror res;
 	int ret; /* zlib return value */
 	z_stream strm;
@@ -247,6 +250,7 @@ hash_add_inline_gzip(struct hash_table *ht, const uint8_t *data, size_t size)
 		return NSERROR_INVALID;
 	}
 	return NSERROR_OK;
+#endif
 
 }
 
