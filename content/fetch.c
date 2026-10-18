@@ -54,7 +54,9 @@
 #include "content/fetchers.h"
 #include "content/fetchers/resource.h"
 #include "content/fetchers/about/about.h"
+#ifdef WITH_CURL
 #include "content/fetchers/curl.h"
+#endif
 #include "content/fetchers/data.h"
 #include "content/fetchers/file/file.h"
 #include "javascript/fetcher.h"
