@@ -249,6 +249,16 @@ static bool gif_convert(struct content *c)
 		content_broadcast_error(c, err, "Zero size image.");
 		return false;
 	}
+#ifdef NETSURF_IMAGE_MAX_PIXELS
+	/* Decoded whole (a frame buffer of its size): refused when that is
+	 * more than the platform's memory can take
+	 */
+	if ((uint64_t)gif_info->width * gif_info->height >
+	    NETSURF_IMAGE_MAX_PIXELS) {
+		content_broadcast_error(c, NSERROR_NOMEM, "Image too large.");
+		return false;
+	}
+#endif
 
 	/* Store our content width, height and calculate size */
 	c->width = gif_info->width;

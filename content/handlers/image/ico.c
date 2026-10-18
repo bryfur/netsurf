@@ -144,6 +144,13 @@ static bool nsico_convert(struct content *c)
 	}
 
 	/* Store our content width, height and calculate size */
+#ifdef NETSURF_IMAGE_MAX_PIXELS
+	if ((uint64_t)ico->ico->width * ico->ico->height >
+	    NETSURF_IMAGE_MAX_PIXELS) {
+		content_broadcast_error(c, NSERROR_NOMEM, "Image too large.");
+		return false;
+	}
+#endif
 	c->width = ico->ico->width;
 	c->height = ico->ico->height;
 	c->size += (ico->ico->width * ico->ico->height * 4) + 16 + 44;

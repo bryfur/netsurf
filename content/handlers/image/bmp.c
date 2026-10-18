@@ -148,6 +148,14 @@ static bool nsbmp_convert(struct content *c)
 			return false;
 	}
 
+#ifdef NETSURF_IMAGE_MAX_PIXELS
+	if ((uint64_t)bmp->bmp->width * bmp->bmp->height >
+	    NETSURF_IMAGE_MAX_PIXELS) {
+		content_broadcast_error(c, NSERROR_NOMEM, "Image too large.");
+		return false;
+	}
+#endif
+
 	/* Store our content width and description */
 	c->width = bmp->bmp->width;
 	c->height = bmp->bmp->height;
