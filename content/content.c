@@ -179,8 +179,9 @@ static void content_update_status(struct content *c)
 			 c->sub_status);
 	} else {
 		snprintf(c->status_message, sizeof (c->status_message),
-			 "%s (%.1fs)", messages_get("Done"),
-			 (float) c->time / 1000);
+			 "%s (%u.%us)", messages_get("Done"),
+			 (unsigned) (c->time / 1000),
+			 (unsigned) (c->time % 1000) / 100);
 	}
 }
 
