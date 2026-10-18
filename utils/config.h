@@ -148,6 +148,10 @@ char *realpath(const char *path, char *resolved_path);
 #if (defined(_WIN32) || defined(__riscos__) || defined(__HAIKU__) || defined(__BEOS__) || defined(__amigaos4__) || defined(__AMIGA__) || defined(__MINT__))
 #undef HAVE_MMAP
 #endif
+#if defined(nsfpc)
+/* The FPC: mmap() of a file on the card is not supported */
+#undef HAVE_MMAP
+#endif
 
 #define HAVE_SCANDIR
 #if (defined(_WIN32) ||				\
