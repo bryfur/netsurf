@@ -243,7 +243,7 @@ html_create_style_element(html_content *c, dom_node *style)
 	if (stylesheets == NULL) {
 
 		content_broadcast_error(&c->base, NSERROR_NOMEM, NULL);
-		return false;
+		return NULL;
 
 	}
 	c->stylesheets = stylesheets;
