@@ -135,6 +135,12 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 bool js_is_running(jsthread *thread);
 
 /**
+ * How many fetches scripts have under way (XMLHttpRequest, fetch), in all
+ * threads: a page whose scripts still fetch has not settled
+ */
+unsigned int js_fetches_pending(void);
+
+/**
  * fire an event at a dom node
  */
 bool js_fire_event(jsthread *thread, const char *type, struct dom_document *doc, struct dom_node *target);

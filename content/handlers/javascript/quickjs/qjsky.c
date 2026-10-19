@@ -25,9 +25,11 @@
  * The JavaScript engine on QuickJS-ng.
  */
 
+#include <ctype.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <nsutils/time.h>
 
 #include "netsurf/inttypes.h"
@@ -38,6 +40,12 @@
 #include "content/content.h"
 #include "netsurf/browser_window.h"
 #include "netsurf/console.h"
+#include "netsurf/misc.h"
+#include "content/fetch.h"
+#include "content/llcache.h"
+#include "desktop/gui_internal.h"
+#include "utils/nsurl.h"
+#include "html/private.h"
 
 #include "javascript/js.h"
 #include "javascript/content.h"
@@ -98,6 +106,9 @@ struct jsthread {
 	JSValue generics; /* generics.js's NetSurf object */
 	struct qjsky_map nodes;
 	struct qjsky_map events;
+	struct js_fetch *fetches; /* the page's script fetches under way */
+	JSValue rejections; /* promises rejected without a handler (an array) */
+	int next_fetch_id;
 	JSValue classes[2 * QJSKY_CLASS_COUNT];
 };
 
@@ -675,7 +686,63 @@ void qjsky_log_exception(JSContext *ctx, const char *what)
 	JS_FreeValue(ctx, exc);
 }
 
-/* the jobs (promise reactions) queued run */
+/* QuickJS's promise rejection tracker: a promise rejected with no handler
+ * is kept until the job queue is empty (a handler may come meanwhile)
+ */
+static void rejection_tracker(JSContext *ctx, JSValueConst promise,
+			      JSValueConst reason, bool is_handled, void *opaque)
+{
+	jsthread *thread = thread_of(ctx);
+	int64_t len = 0, i;
+
+	if (thread == NULL || !JS_IsArray(thread->rejections)) {
+		return;
+	}
+	JS_GetLength(ctx, thread->rejections, &len);
+	if (!is_handled) {
+		JSValue pair = JS_NewArray(ctx);
+		JS_SetPropertyUint32(ctx, pair, 0, JS_DupValue(ctx, promise));
+		JS_SetPropertyUint32(ctx, pair, 1, JS_DupValue(ctx, reason));
+		JS_SetPropertyInt64(ctx, thread->rejections, len, pair);
+		return;
+	}
+	for (i = 0; i < len; i++) {
+		JSValue pair = JS_GetPropertyInt64(ctx, thread->rejections, i);
+		JSValue p = JS_GetPropertyUint32(ctx, pair, 0);
+		bool same = JS_IsStrictEqual(ctx, p, promise);
+		JS_FreeValue(ctx, p);
+		JS_FreeValue(ctx, pair);
+		if (same) {
+			JS_SetPropertyInt64(ctx, thread->rejections, i, JS_NULL);
+			break;
+		}
+	}
+}
+
+/* the rejections still unhandled: logged as uncaught, as browsers do */
+static void report_rejections(JSContext *ctx)
+{
+	jsthread *thread = thread_of(ctx);
+	int64_t len = 0, i;
+
+	if (thread == NULL || !JS_IsArray(thread->rejections) ||
+	    JS_GetLength(ctx, thread->rejections, &len) < 0 || len == 0) {
+		return;
+	}
+	for (i = 0; i < len; i++) {
+		JSValue pair = JS_GetPropertyInt64(ctx, thread->rejections, i);
+		if (JS_IsObject(pair)) {
+			JS_Throw(ctx, JS_GetPropertyUint32(ctx, pair, 1));
+			qjsky_log_exception(ctx, "in promise");
+		}
+		JS_FreeValue(ctx, pair);
+	}
+	JS_SetPropertyStr(ctx, thread->rejections, "length", JS_NewInt32(ctx, 0));
+}
+
+/* the jobs (promise reactions) queued run, then the rejections no handler
+ * took reported
+ */
 static void run_jobs(JSContext *ctx)
 {
 	JSRuntime *rt = JS_GetRuntime(ctx);
@@ -687,6 +754,7 @@ static void run_jobs(JSContext *ctx)
 			qjsky_log_exception(job_ctx, "job");
 		}
 	}
+	report_rejections(ctx);
 }
 
 JSValue qjsky_call(JSContext *ctx, JSValueConst func, JSValueConst this_val,
@@ -1175,6 +1243,519 @@ void qjsky_register_event_listener_for(JSContext *ctx, struct dom_element *ele,
 	dom_event_listener_unref(listen);
 }
 
+/*** script fetches: the primitive of fetch() and XMLHttpRequest ***/
+
+#define JS_FETCH_MAX_BODY (8 * 1024 * 1024)
+#define JS_FETCH_MAX_REDIRECTS 20
+
+struct js_fetch {
+	struct js_fetch *next;
+	jsthread *thread;
+	int id;
+	JSValue callback;
+	struct fetch *fetch;
+	nsurl *url;
+	nsurl *referer;
+	char *method;
+	char **headers;	/* the script's, "Name: value", NULL terminated */
+	char *body;	/* NUL terminated, or NULL */
+	nsurl *origin;	/* the page's */
+	bool cors;	/* cross origin: no cookies, the response checked */
+	int redirects;
+	char *rhead;	/* the response's header lines */
+	size_t rhead_len;
+	uint8_t *data;
+	size_t len, cap;
+};
+
+static void js_fetch_start(void *p);
+
+static unsigned int js_fetches; /* under way, in all threads */
+
+/* exported interface documented in js.h */
+unsigned int js_fetches_pending(void)
+{
+	return js_fetches;
+}
+
+static void js_fetch_free(struct js_fetch *jf)
+{
+	jsthread *thread = jf->thread;
+	struct js_fetch **pp;
+	int i;
+
+	js_fetches--;
+	for (pp = &thread->fetches; *pp != NULL; pp = &(*pp)->next) {
+		if (*pp == jf) {
+			*pp = jf->next;
+			break;
+		}
+	}
+	guit->misc->schedule(-1, js_fetch_start, jf);
+	if (jf->fetch != NULL) {
+		fetch_abort(jf->fetch);
+	}
+	JS_FreeValue(thread->ctx, jf->callback);
+	nsurl_unref(jf->url);
+	if (jf->referer != NULL) {
+		nsurl_unref(jf->referer);
+	}
+	if (jf->origin != NULL) {
+		nsurl_unref(jf->origin);
+	}
+	for (i = 0; jf->headers != NULL && jf->headers[i] != NULL; i++) {
+		free(jf->headers[i]);
+	}
+	free(jf->headers);
+	free(jf->method);
+	free(jf->body);
+	free(jf->rhead);
+	free(jf->data);
+	free(jf);
+}
+
+/* the result to the script: ("done", status, url, headers, ArrayBuffer,
+ * redirected)
+ * or ("error", message); the fetch freed
+ */
+static void js_fetch_deliver(struct js_fetch *jf, const char *error, int status)
+{
+	jsthread *thread = jf->thread;
+	JSContext *ctx = thread->ctx;
+	JSValue args[6], ret;
+	int argc;
+
+	if (thread->pending_destroy) {
+		js_fetch_free(jf);
+		return;
+	}
+	if (error == NULL && jf->cors) {
+		/* cross origin: readable if the server says so */
+		const char *acao = NULL;
+		char *line;
+		for (line = jf->rhead; line != NULL && *line != 0; ) {
+			if (strncasecmp(line, "Access-Control-Allow-Origin:", 28) == 0) {
+				acao = line + 28;
+				break;
+			}
+			line = strchr(line, '\n');
+			line = line != NULL ? line + 1 : NULL;
+		}
+		if (acao != NULL) {
+			char *o = NULL;
+			size_t olen = 0;
+			while (*acao == ' ') {
+				acao++;
+			}
+			nsurl_get(jf->origin, NSURL_SCHEME | NSURL_HOST | NSURL_PORT, &o, &olen);
+			if (!(acao[0] == '*' && (acao[1] == '\r' || acao[1] == '\n')) &&
+			    (o == NULL || strncmp(acao, o, olen) != 0 ||
+			     (acao[olen] != '\r' && acao[olen] != '\n'))) {
+				acao = NULL;
+			}
+			free(o);
+		}
+		if (acao == NULL) {
+			error = "a cross-origin response the server does not allow";
+		}
+	}
+
+	thread->in_use++;
+	if (error != NULL) {
+		args[0] = JS_NewString(ctx, "error");
+		args[1] = JS_NewString(ctx, error);
+		argc = 2;
+	} else {
+		args[0] = JS_NewString(ctx, "done");
+		args[1] = JS_NewInt32(ctx, status);
+		args[2] = JS_NewString(ctx, nsurl_access(jf->url));
+		args[3] = JS_NewString(ctx, jf->rhead != NULL ? jf->rhead : "");
+		args[4] = JS_NewArrayBufferCopy(ctx, jf->data, jf->len);
+		args[5] = JS_NewBool(ctx, jf->redirects > 0);
+		argc = 6;
+	}
+	ret = qjsky_call(ctx, jf->callback, JS_UNDEFINED, argc, (JSValueConst *)args);
+	JS_FreeValue(ctx, ret);
+	while (argc-- > 0) {
+		JS_FreeValue(ctx, args[argc]);
+	}
+	js_fetch_free(jf);
+	thread->in_use--;
+	if (thread->in_use == 0 && thread->pending_destroy) {
+		js_destroythread(thread);
+	}
+}
+
+static void js_fetch_callback(const fetch_msg *msg, void *p)
+{
+	struct js_fetch *jf = p;
+
+	switch (msg->type) {
+	case FETCH_HEADER: {
+		/* "Name: value" lines, kept as they come */
+		size_t n = msg->data.header_or_data.len;
+		char *h = realloc(jf->rhead, jf->rhead_len + n + 2);
+		if (h != NULL) {
+			memcpy(h + jf->rhead_len, msg->data.header_or_data.buf, n);
+			jf->rhead_len += n;
+			if (jf->rhead_len == 0 || h[jf->rhead_len - 1] != '\n') {
+				h[jf->rhead_len++] = '\n';
+			}
+			h[jf->rhead_len] = 0;
+			jf->rhead = h;
+		}
+		break;
+	}
+	case FETCH_DATA: {
+		size_t n = msg->data.header_or_data.len;
+		if (jf->len + n > JS_FETCH_MAX_BODY) {
+			fetch_abort(jf->fetch);
+			jf->fetch = NULL;
+			js_fetch_deliver(jf, "the response is too big", 0);
+			return;
+		}
+		if (jf->len + n > jf->cap) {
+			size_t cap = (jf->len + n) * 2;
+			uint8_t *d = realloc(jf->data, cap);
+			if (d == NULL) {
+				break;
+			}
+			jf->data = d;
+			jf->cap = cap;
+		}
+		memcpy(jf->data + jf->len, msg->data.header_or_data.buf, n);
+		jf->len += n;
+		break;
+	}
+	case FETCH_FINISHED:
+	case FETCH_NOTMODIFIED: {
+		int status = fetch_http_code(jf->fetch);
+		jf->fetch = NULL; /* the fetch layer frees it */
+		js_fetch_deliver(jf, NULL, status != 0 ? status : 200);
+		break;
+	}
+	case FETCH_REDIRECT: {
+		int status = fetch_http_code(jf->fetch);
+		nsurl *to;
+		jf->fetch = NULL;
+		if (jf->redirects++ >= JS_FETCH_MAX_REDIRECTS ||
+		    nsurl_join(jf->url, msg->data.redirect, &to) != NSERROR_OK) {
+			js_fetch_deliver(jf, "too many redirects, or a bad one", 0);
+			break;
+		}
+		nsurl_unref(jf->url);
+		jf->url = to;
+		/* 303 (and 301, 302 from a POST): a GET, no body */
+		if (status == 303 || ((status == 301 || status == 302) &&
+				      strcmp(jf->method, "POST") == 0)) {
+			free(jf->method);
+			jf->method = strdup("GET");
+			free(jf->body);
+			jf->body = NULL;
+		}
+		free(jf->rhead);
+		jf->rhead = NULL;
+		jf->rhead_len = 0;
+		jf->len = 0;
+		guit->misc->schedule(0, js_fetch_start, jf);
+		break;
+	}
+	case FETCH_PROGRESS:
+	case FETCH_CERTS:
+		break;
+	default:
+		/* an error, a timeout, authentication, certificates */
+		jf->fetch = NULL;
+		js_fetch_deliver(jf, msg->type == FETCH_ERROR && msg->data.error != NULL ?
+				 msg->data.error : "the fetch failed", 0);
+		break;
+	}
+}
+
+/* whether a cross-origin request is a simple one (no preflight needed) */
+static bool js_fetch_simple(struct js_fetch *jf)
+{
+	int i;
+
+	if (strcmp(jf->method, "GET") != 0 && strcmp(jf->method, "POST") != 0 &&
+	    strcmp(jf->method, "HEAD") != 0) {
+		return false;
+	}
+	for (i = 0; jf->headers != NULL && jf->headers[i] != NULL; i++) {
+		const char *h = jf->headers[i];
+		if (strncasecmp(h, "Accept:", 7) == 0 ||
+		    strncasecmp(h, "Accept-Language:", 16) == 0 ||
+		    strncasecmp(h, "Content-Language:", 17) == 0) {
+			continue;
+		}
+		if (strncasecmp(h, "Content-Type:", 13) == 0) {
+			const char *v = h + 13;
+			while (*v == ' ') {
+				v++;
+			}
+			if (strncasecmp(v, "text/plain", 10) == 0 ||
+			    strncasecmp(v, "application/x-www-form-urlencoded", 33) == 0 ||
+			    strncasecmp(v, "multipart/form-data", 19) == 0) {
+				continue;
+			}
+		}
+		return false;
+	}
+	return true;
+}
+
+/* (scheduled) the fetch started, or started again after a redirect */
+static void js_fetch_start(void *p)
+{
+	struct js_fetch *jf = p;
+	const char *hdrs[64];
+	char method_hdr[48];
+	char *origin_hdr = NULL;
+	int n = 0, i;
+	nserror err;
+
+	jf->cors = nsurl_compare(jf->origin, jf->url,
+				 NSURL_SCHEME | NSURL_HOST | NSURL_PORT) == false;
+	if (jf->cors && !js_fetch_simple(jf)) {
+		js_fetch_deliver(jf, "a cross-origin request that is not simple (preflight is not supported)", 0);
+		return;
+	}
+	if (strcmp(jf->method, "GET") != 0 &&
+	    !(strcmp(jf->method, "POST") == 0 && jf->body != NULL)) {
+		/* HEAD: a GET whose body is dropped (fetch.js) */
+		snprintf(method_hdr, sizeof(method_hdr), "X-NetSurf-Method: %s",
+			 strcmp(jf->method, "HEAD") == 0 ? "GET" : jf->method);
+		hdrs[n++] = method_hdr;
+	}
+	if (jf->cors) {
+		char *o = NULL;
+		size_t olen;
+		hdrs[n++] = "X-NetSurf-No-Cookies: 1";
+		if (nsurl_get(jf->origin, NSURL_SCHEME | NSURL_HOST | NSURL_PORT,
+			      &o, &olen) == NSERROR_OK) {
+			origin_hdr = malloc(olen + 9);
+			if (origin_hdr != NULL) {
+				sprintf(origin_hdr, "Origin: %s", o);
+				hdrs[n++] = origin_hdr;
+			}
+			free(o);
+		}
+	}
+	for (i = 0; jf->headers != NULL && jf->headers[i] != NULL && n < 62; i++) {
+		hdrs[n++] = jf->headers[i];
+	}
+	hdrs[n] = NULL;
+
+	err = fetch_start(jf->url, jf->referer, js_fetch_callback, jf, false,
+			  (strcmp(jf->method, "GET") == 0 || strcmp(jf->method, "HEAD") == 0) ?
+			  NULL : (jf->body != NULL ? jf->body : ""),
+			  NULL, true, false, hdrs, &jf->fetch);
+	free(origin_hdr);
+	if (err != NSERROR_OK) {
+		jf->fetch = NULL;
+		js_fetch_deliver(jf, "the fetch could not start", 0);
+	}
+}
+
+/* forbidden request headers (the fetch standard's): the browser's own */
+static bool js_fetch_forbidden(const char *name)
+{
+	static const char *const forbidden[] = {
+		"accept-charset", "accept-encoding", "access-control-request-headers",
+		"access-control-request-method", "connection", "content-length",
+		"cookie", "cookie2", "date", "dnt", "expect", "host", "keep-alive",
+		"origin", "referer", "te", "trailer", "transfer-encoding", "upgrade",
+		"user-agent", "via",
+	};
+	size_t i;
+
+	if (strncasecmp(name, "proxy-", 6) == 0 || strncasecmp(name, "sec-", 4) == 0 ||
+	    strncasecmp(name, "x-netsurf-", 10) == 0) {
+		return true;
+	}
+	for (i = 0; i < sizeof(forbidden) / sizeof(forbidden[0]); i++) {
+		if (strcasecmp(name, forbidden[i]) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* __nsfetch(method, url, headers [[name, value], ...], body, callback):
+ * an id (abortable with __nsfetch_abort(id))
+ */
+static JSValue js_nsfetch(JSContext *ctx, JSValueConst this_val, int argc,
+			  JSValueConst *argv)
+{
+	jsthread *thread = thread_of(ctx);
+	window_private_t *win = thread->window;
+	struct js_fetch *jf;
+	const char *s;
+	nsurl *base;
+	int64_t nh = 0, i;
+	int k = 0;
+
+	if (argc < 5 || !JS_IsFunction(ctx, argv[4]) || win == NULL ||
+	    win->htmlc == NULL) {
+		return JS_ThrowTypeError(ctx, "__nsfetch: bad arguments");
+	}
+	jf = calloc(1, sizeof(*jf));
+	if (jf == NULL) {
+		return JS_ThrowOutOfMemory(ctx);
+	}
+	jf->thread = thread;
+	jf->callback = JS_DupValue(ctx, argv[4]);
+	jf->id = ++thread->next_fetch_id;
+	js_fetches++;
+
+	s = JS_ToCString(ctx, argv[0]);
+	jf->method = s != NULL ? strdup(s) : NULL;
+	JS_FreeCString(ctx, s);
+	if (jf->method != NULL) {
+		char *m;
+		for (m = jf->method; *m; m++) {
+			*m = toupper((unsigned char)*m);
+		}
+	}
+
+	base = win->htmlc->base_url != NULL ? win->htmlc->base_url :
+		llcache_handle_get_url(win->htmlc->base.llcache);
+	jf->origin = nsurl_ref(llcache_handle_get_url(win->htmlc->base.llcache));
+	jf->referer = nsurl_ref(jf->origin);
+	s = JS_ToCString(ctx, argv[1]);
+	if (s == NULL || jf->method == NULL || nsurl_join(base, s, &jf->url) != NSERROR_OK) {
+		JS_FreeCString(ctx, s);
+		jf->url = nsurl_ref(base);
+		jf->next = thread->fetches;
+		thread->fetches = jf;
+		js_fetch_free(jf);
+		return JS_ThrowSyntaxError(ctx, "__nsfetch: not a URL");
+	}
+	JS_FreeCString(ctx, s);
+
+	if (JS_IsArray(argv[2]) && JS_GetLength(ctx, argv[2], &nh) == 0 && nh > 0) {
+		jf->headers = calloc(nh + 1, sizeof(char *));
+		for (i = 0; jf->headers != NULL && i < nh && i < 60; i++) {
+			JSValue pair = JS_GetPropertyInt64(ctx, argv[2], i);
+			JSValue nv = JS_GetPropertyUint32(ctx, pair, 0);
+			JSValue vv = JS_GetPropertyUint32(ctx, pair, 1);
+			const char *name = JS_ToCString(ctx, nv);
+			const char *value = JS_ToCString(ctx, vv);
+			if (name != NULL && value != NULL && name[0] != 0 &&
+			    strpbrk(name, ": \r\n") == NULL && strpbrk(value, "\r\n") == NULL &&
+			    !js_fetch_forbidden(name)) {
+				jf->headers[k] = malloc(strlen(name) + strlen(value) + 3);
+				if (jf->headers[k] != NULL) {
+					sprintf(jf->headers[k], "%s: %s", name, value);
+					k++;
+				}
+			}
+			JS_FreeCString(ctx, name);
+			JS_FreeCString(ctx, value);
+			JS_FreeValue(ctx, vv);
+			JS_FreeValue(ctx, nv);
+			JS_FreeValue(ctx, pair);
+		}
+	}
+	if (!JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3])) {
+		size_t blen;
+		s = JS_ToCStringLen(ctx, &blen, argv[3]);
+		if (s != NULL) {
+			jf->body = malloc(blen + 1);
+			if (jf->body != NULL) {
+				memcpy(jf->body, s, blen + 1);
+			}
+		}
+		JS_FreeCString(ctx, s);
+	}
+
+	jf->next = thread->fetches;
+	thread->fetches = jf;
+	guit->misc->schedule(0, js_fetch_start, jf);
+	return JS_NewInt32(ctx, jf->id);
+}
+
+static JSValue js_nsfetch_abort(JSContext *ctx, JSValueConst this_val, int argc,
+				JSValueConst *argv)
+{
+	jsthread *thread = thread_of(ctx);
+	struct js_fetch *jf;
+	int32_t id = 0;
+
+	if (argc > 0) {
+		JS_ToInt32(ctx, &id, argv[0]);
+	}
+	for (jf = thread->fetches; jf != NULL; jf = jf->next) {
+		if (jf->id == id) {
+			js_fetch_free(jf);
+			break;
+		}
+	}
+	return JS_UNDEFINED;
+}
+
+/* __nsutf8decode(buffer[, fatal]): a string of UTF-8 bytes;
+ * __nsutf8encode(string): its UTF-8 bytes as a Uint8Array
+ */
+static JSValue js_utf8decode(JSContext *ctx, JSValueConst this_val, int argc,
+			     JSValueConst *argv)
+{
+	size_t size, off = 0, len = 0, bpe;
+	uint8_t *buf;
+	JSValue abuf = JS_UNDEFINED;
+
+	if (argc < 1) {
+		return JS_NewStringLen(ctx, "", 0);
+	}
+	buf = JS_GetArrayBuffer(ctx, &size, argv[0]);
+	if (buf != NULL) {
+		len = size;
+	} else {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		abuf = JS_GetTypedArrayBuffer(ctx, argv[0], &off, &len, &bpe);
+		if (JS_IsException(abuf)) {
+			return JS_ThrowTypeError(ctx, "not a buffer");
+		}
+		buf = JS_GetArrayBuffer(ctx, &size, abuf);
+		JS_FreeValue(ctx, abuf);
+		if (buf == NULL) {
+			return JS_ThrowTypeError(ctx, "a detached buffer");
+		}
+		buf += off;
+	}
+	return JS_NewStringLen(ctx, (const char *)buf, len);
+}
+
+static JSValue js_utf8encode(JSContext *ctx, JSValueConst this_val, int argc,
+			     JSValueConst *argv)
+{
+	size_t len;
+	const char *s = JS_ToCStringLen(ctx, &len, argc > 0 ? argv[0] : JS_UNDEFINED);
+	JSValue abuf, args[3], arr;
+
+	if (s == NULL) {
+		return JS_EXCEPTION;
+	}
+	abuf = JS_NewArrayBufferCopy(ctx, (const uint8_t *)s, len);
+	JS_FreeCString(ctx, s);
+	if (JS_IsException(abuf)) {
+		return abuf;
+	}
+	args[0] = abuf;
+	args[1] = JS_NewInt32(ctx, 0);
+	args[2] = JS_NewInt64(ctx, len);
+	arr = JS_NewTypedArray(ctx, 3, args, JS_TYPED_ARRAY_UINT8);
+	JS_FreeValue(ctx, abuf);
+	return arr;
+}
+
+static const JSCFunctionListEntry js_natives[] = {
+	JS_CFUNC_DEF("__nsfetch", 5, js_nsfetch),
+	JS_CFUNC_DEF("__nsfetch_abort", 1, js_nsfetch_abort),
+	JS_CFUNC_DEF("__nsutf8decode", 1, js_utf8decode),
+	JS_CFUNC_DEF("__nsutf8encode", 1, js_utf8encode),
+};
+
 /*** the engine's interface (js.h) ***/
 
 /* exported interface documented in js.h */
@@ -1216,6 +1797,7 @@ static JSRuntime *heap_runtime(jsheap *heap)
 	JS_SetRuntimeOpaque(heap->rt, heap);
 	JS_SetMaxStackSize(heap->rt, NETSURF_JS_STACK);
 	JS_SetInterruptHandler(heap->rt, interrupt_handler, heap);
+	JS_SetHostPromiseRejectionTracker(heap->rt, rejection_tracker, heap);
 	if (qjsky_runtime_init(heap->rt) < 0) {
 		JS_FreeRuntime(heap->rt);
 		heap->rt = NULL;
@@ -1313,6 +1895,7 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv, jsthread **th
 	ret->win_priv = win_priv;
 	ret->doc_priv = doc_priv;
 	ret->generics = JS_UNDEFINED;
+	ret->rejections = JS_UNDEFINED;
 	for (i = 0; i < 2 * QJSKY_CLASS_COUNT; i++) {
 		ret->classes[i] = JS_UNDEFINED;
 	}
@@ -1351,6 +1934,7 @@ static JSContext *thread_context(jsthread *thread)
 	mem_report(rt, "context");
 	thread->ctx = ctx;
 	JS_SetContextOpaque(ctx, thread);
+	thread->rejections = JS_NewArray(ctx);
 
 	/* the global object is the Window */
 	global = JS_GetGlobalObject(ctx);
@@ -1372,7 +1956,11 @@ static JSContext *thread_context(jsthread *thread)
 	}
 	mem_report(rt, "window");
 
-	/* the polyfills, then NetSurf's generics (taken off the global) */
+	/* the polyfills (which take the natives off the global), then
+	 * NetSurf's generics (taken off the global)
+	 */
+	JS_SetPropertyFunctionList(ctx, global, js_natives,
+				   sizeof(js_natives) / sizeof(js_natives[0]));
 	if (run_internal(ctx, polyfill_js, polyfill_js_len, "polyfill.js") < 0 ||
 	    run_internal(ctx, generics_js, generics_js_len, "generics.js") < 0) {
 		JS_FreeValue(ctx, global);
@@ -1425,9 +2013,14 @@ static void destroythread(jsthread *thread)
 	if (thread->window != NULL) {
 		qjsky_window_closedown(ctx, thread->window);
 	}
+	while (thread->fetches != NULL) {
+		js_fetch_free(thread->fetches);
+	}
 	map_free(ctx, &thread->events);
 	map_free(ctx, &thread->nodes);
 	JS_FreeValue(ctx, thread->generics);
+	JS_FreeValue(ctx, thread->rejections);
+	thread->rejections = JS_UNDEFINED;
 	for (i = 0; i < 2 * QJSKY_CLASS_COUNT; i++) {
 		JS_FreeValue(ctx, thread->classes[i]);
 		thread->classes[i] = JS_UNDEFINED;

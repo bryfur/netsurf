@@ -76,6 +76,11 @@ bool js_is_running(jsthread *thread)
 	return false;
 }
 
+unsigned int js_fetches_pending(void)
+{
+	return 0;
+}
+
 void js_handle_new_element(jsthread *thread, struct dom_element *node)
 {
 }

@@ -838,6 +838,12 @@ static void dukky_leave_thread(jsthread *thread)
 }
 
 /* exported interface documented in js.h */
+unsigned int js_fetches_pending(void)
+{
+	return 0;
+}
+
+/* exported interface documented in js.h */
 bool js_is_running(jsthread *thread)
 {
 	return thread != NULL && thread->in_use > 0;
