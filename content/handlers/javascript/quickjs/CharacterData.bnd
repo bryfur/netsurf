@@ -1,0 +1,128 @@
+/* CharacterData binding for browser using QuickJS-ng and libdom
+ *
+ * Copyright 2026 Bryan Furia <bryan.furia@gmail.com>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+prologue CharacterData()
+%{
+#define CDATA(priv) ((dom_characterdata *)((node_private_t *)(priv))->node)
+
+/* an unsigned long argument (WebIDL: modulo 2^32) */
+static int cdata_ulong(JSContext *ctx, JSValueConst v, uint32_t *out)
+{
+	return JS_ToUint32(ctx, out, v);
+}
+
+/* a DOMString argument, null as "" when null_empty */
+static dom_exception cdata_string(JSContext *ctx, JSValueConst v, bool null_empty,
+				  dom_string **out)
+{
+	if (null_empty && JS_IsNull(v)) {
+		return dom_string_create((const uint8_t *)"", 0, out);
+	}
+	return qjsky_dom_string(ctx, v, out);
+}
+%}
+
+getter CharacterData::data()
+%{
+	dom_string *data = NULL;
+	dom_exception exc = dom_characterdata_get_data(CDATA(priv), &data);
+	return qjsky_string_result(ctx, exc, data, false);
+%}
+
+setter CharacterData::data()
+%{
+	dom_string *data;
+	dom_exception exc;
+
+	if (cdata_string(ctx, val, true, &data) != DOM_NO_ERR) {
+		return JS_HasException(ctx) ? JS_EXCEPTION : JS_ThrowOutOfMemory(ctx);
+	}
+	exc = dom_characterdata_set_data(CDATA(priv), data);
+	dom_string_unref(data);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+%}
+
+getter CharacterData::length()
+%{
+	uint32_t length = 0;
+	dom_exception exc = dom_characterdata_get_length(CDATA(priv), &length);
+	if (exc != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, exc);
+	}
+	return JS_NewUint32(ctx, length);
+%}
+
+method CharacterData::substringData()
+%{
+	uint32_t offset, count;
+	dom_string *data = NULL;
+	dom_exception exc;
+
+	if (cdata_ulong(ctx, argv[0], &offset) < 0 || cdata_ulong(ctx, argv[1], &count) < 0) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_characterdata_substring_data(CDATA(priv), offset, count, &data);
+	return qjsky_string_result(ctx, exc, data, false);
+%}
+
+method CharacterData::appendData()
+%{
+	dom_string *data;
+	dom_exception exc;
+
+	if (qjsky_dom_string(ctx, argv[0], &data) != DOM_NO_ERR) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_characterdata_append_data(CDATA(priv), data);
+	dom_string_unref(data);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+%}
+
+method CharacterData::insertData()
+%{
+	uint32_t offset;
+	dom_string *data;
+	dom_exception exc;
+
+	if (cdata_ulong(ctx, argv[0], &offset) < 0 ||
+	    qjsky_dom_string(ctx, argv[1], &data) != DOM_NO_ERR) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_characterdata_insert_data(CDATA(priv), offset, data);
+	dom_string_unref(data);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+%}
+
+method CharacterData::deleteData()
+%{
+	uint32_t offset, count;
+	dom_exception exc;
+
+	if (cdata_ulong(ctx, argv[0], &offset) < 0 || cdata_ulong(ctx, argv[1], &count) < 0) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_characterdata_delete_data(CDATA(priv), offset, count);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+%}
+
+method CharacterData::replaceData()
+%{
+	uint32_t offset, count;
+	dom_string *data;
+	dom_exception exc;
+
+	if (cdata_ulong(ctx, argv[0], &offset) < 0 || cdata_ulong(ctx, argv[1], &count) < 0 ||
+	    qjsky_dom_string(ctx, argv[2], &data) != DOM_NO_ERR) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_characterdata_replace_data(CDATA(priv), offset, count, data);
+	dom_string_unref(data);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+%}

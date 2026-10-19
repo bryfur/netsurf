@@ -10,7 +10,7 @@
  */
 (function (natives) {
     "use strict";
-    var nsfetch = natives.fetch, nsabort = natives.abort;
+    var nsfetch = natives.fetch, nsabort = natives.abort, urlparse = natives.urlparse;
     var utf8decode = natives.utf8decode, utf8encode = natives.utf8encode;
     var exports = {};
 
@@ -88,19 +88,20 @@
 	});
     }
     URLSearchParams.prototype = {
-	append: function (k, v) { this._l.push([String(k), String(v)]); },
-	delete: function (k) { k = String(k); this._l = this._l.filter(function (p) { return p[0] !== k; }); },
+	append: function (k, v) { this._l.push([String(k), String(v)]); changed(this); },
+	delete: function (k) { k = String(k); this._l = this._l.filter(function (p) { return p[0] !== k; }); changed(this); },
 	get: function (k) { k = String(k); for (var p of this._l) if (p[0] === k) return p[1]; return null; },
 	getAll: function (k) { k = String(k); return this._l.filter(function (p) { return p[0] === k; }).map(function (p) { return p[1]; }); },
 	has: function (k) { return this.get(k) !== null; },
 	set: function (k, v) {
 	    k = String(k); v = String(v);
 	    var i = this._l.findIndex(function (p) { return p[0] === k; });
-	    if (i < 0) { this._l.push([k, v]); return; }
+	    if (i < 0) { this._l.push([k, v]); changed(this); return; }
 	    this._l[i][1] = v;
 	    this._l = this._l.filter(function (p, j) { return j <= i || p[0] !== k; });
+	    changed(this);
 	},
-	sort: function () { this._l.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); },
+	sort: function () { this._l.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); changed(this); },
 	toString: function () { return this._l.map(function (p) { return encodeForm(p[0]) + "=" + encodeForm(p[1]); }).join("&"); },
 	forEach: function (f, t) { this._l.forEach(function (p) { f.call(t, p[1], p[0], this); }, this); },
 	entries: function () { return this._l.map(function (p) { return [p[0], p[1]]; })[Symbol.iterator](); },
@@ -109,13 +110,138 @@
 	get size() { return this._l.length; }
     };
     URLSearchParams.prototype[Symbol.iterator] = URLSearchParams.prototype.entries;
+    /* a URL's searchParams tells it of changes */
+    function changed(sp) {
+	if (sp._url) sp._url._setSearch(sp.toString());
+    }
     define("URLSearchParams", URLSearchParams);
+
+    /* URL: parsed by NetSurf's nsurl (natives.urlparse: the parts, or null
+     * when it is not a URL); a part set makes the URL again from the parts
+     */
+    var DEFAULT_PORTS = { "http:": "80", "https:": "443", "ws:": "80", "wss:": "443", "ftp:": "21" };
+    function parseURL(input, base) {
+	input = String(input).replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, "").replace(/[\t\n\r]/g, "");
+	if (base === null && !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(input)) return null;
+	var p = urlparse(input, base);
+	if (!p) return null;
+	p.protocol = p.protocol.replace(/:?$/, ":").toLowerCase();
+	p.port = p.port.replace(/^:/, "");
+	if (DEFAULT_PORTS[p.protocol] === p.port) p.port = "";
+	p.search = p.search === "" || p.search === "?" ? "" : "?" + p.search.replace(/^\?/, "");
+	p.hash = p.hash === "" || p.hash === "#" ? "" : "#" + p.hash.replace(/^#/, "");
+	return p;
+    }
+    function compose(p) {
+	var auth = "";
+	if (p.hostname || p.protocol === "file:") {
+	    auth = "//";
+	    if (p.username) auth += p.username + (p.password ? ":" + p.password : "") + "@";
+	    auth += p.hostname + (p.port ? ":" + p.port : "");
+	}
+	return p.protocol + auth + p.pathname + p.search + p.hash;
+    }
+    function URL(url, base) {
+	if (!new.target) throw new TypeError("URL: use new");
+	var b = null;
+	if (base !== undefined) {
+	    var bp = parseURL(base, null);
+	    if (!bp) throw new TypeError("'" + base + "' is not a valid base URL");
+	    b = bp.href;
+	}
+	var p = parseURL(url, b);
+	if (!p) throw new TypeError("'" + url + "' is not a valid URL");
+	this._p = p;
+	this._sp = null;
+    }
+    function part(name, set) {
+	return {
+	    get: function () { return this._p[name]; },
+	    set: function (v) {
+		var q = Object.assign({}, this._p);
+		set(q, String(v));
+		var p = parseURL(compose(q), null);
+		if (p) {
+		    this._p = p;
+		    if (this._sp) this._sp._l = new URLSearchParams(p.search)._l;
+		}
+	    },
+	    enumerable: true, configurable: true
+	};
+    }
+    Object.defineProperties(URL.prototype, {
+	href: {
+	    get: function () { return this._p.href; },
+	    set: function (v) {
+		var p = parseURL(v, null);
+		if (!p) throw new TypeError("'" + v + "' is not a valid URL");
+		this._p = p;
+		if (this._sp) this._sp._l = new URLSearchParams(p.search)._l;
+	    },
+	    enumerable: true, configurable: true
+	},
+	origin: {
+	    get: function () {
+		var p = this._p;
+		return DEFAULT_PORTS[p.protocol] !== undefined ? p.protocol + "//" + p.hostname + (p.port ? ":" + p.port : "") : "null";
+	    },
+	    enumerable: true, configurable: true
+	},
+	protocol: part("protocol", function (q, v) { q.protocol = v.replace(/:.*$/, "") + ":"; }),
+	username: part("username", function (q, v) { q.username = encodeURIComponent(v); }),
+	password: part("password", function (q, v) { q.password = encodeURIComponent(v); }),
+	host: {
+	    get: function () { return this._p.hostname + (this._p.port ? ":" + this._p.port : ""); },
+	    set: part("host", function (q, v) {
+		var m = /^([^:\/?#]*)(?::(\d*))?/.exec(v);
+		q.hostname = m[1];
+		if (m[2] !== undefined) q.port = m[2];
+	    }).set,
+	    enumerable: true, configurable: true
+	},
+	hostname: part("hostname", function (q, v) { q.hostname = v.replace(/[:\/?#].*$/, ""); }),
+	port: part("port", function (q, v) { q.port = v.replace(/\D.*$/, ""); }),
+	pathname: part("pathname", function (q, v) { q.pathname = (v.charAt(0) === "/" ? "" : "/") + v.replace(/[?#]/g, encodeURIComponent); }),
+	search: part("search", function (q, v) { v = v.replace(/^\?/, ""); q.search = v ? "?" + v.replace(/#/g, "%23") : ""; }),
+	hash: part("hash", function (q, v) { v = v.replace(/^#/, ""); q.hash = v ? "#" + v : ""; }),
+	searchParams: {
+	    get: function () {
+		if (!this._sp) {
+		    this._sp = new URLSearchParams(this._p.search);
+		    this._sp._url = this;
+		}
+		return this._sp;
+	    },
+	    enumerable: true, configurable: true
+	}
+    });
+    URL.prototype._setSearch = function (s) {
+	var q = Object.assign({}, this._p);
+	q.search = s ? "?" + s : "";
+	var p = parseURL(compose(q), null);
+	if (p) this._p = p;
+    };
+    URL.prototype.toString = URL.prototype.toJSON = function () { return this._p.href; };
+    URL.canParse = function (url, base) {
+	try { new URL(url, base); return true; } catch (e) { return false; }
+    };
+    URL.parse = function (url, base) {
+	try { return new URL(url, base); } catch (e) { return null; }
+    };
+    /* object URLs: a data: URL of the blob (NetSurf fetches those) */
+    URL.createObjectURL = function (blob) {
+	if (!blob || typeof blob._nsDataURL !== "function") throw new TypeError("createObjectURL: not a Blob");
+	return blob._nsDataURL();
+    };
+    URL.revokeObjectURL = function () {};
+    define("URL", URL);
 
     /* a body for the primitive: a string (UTF-8) and the Content-Type it implies */
     function bodyOf(body) {
 	if (body === undefined || body === null) return { text: null, type: null };
 	if (typeof body === "string") return { text: body, type: "text/plain;charset=UTF-8" };
 	if (body instanceof URLSearchParams) return { text: body.toString(), type: "application/x-www-form-urlencoded;charset=UTF-8" };
+	if (typeof body._nsBody === "function") return body._nsBody();   /* FormData, Blob */
 	if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return { text: utf8decode(body), type: null };
 	return { text: String(body), type: "text/plain;charset=UTF-8" };
     }

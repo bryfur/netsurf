@@ -46,6 +46,8 @@
 #include "desktop/gui_internal.h"
 #include "utils/nsurl.h"
 #include "html/private.h"
+#include "html/box.h"
+#include "html/box_inspect.h"
 
 #include "javascript/js.h"
 #include "javascript/content.h"
@@ -58,6 +60,7 @@
 #include "quickjs/selectors.js.inc"
 #include "quickjs/net.js.inc"
 #include "quickjs/domexception.js.inc"
+#include "quickjs/web.js.inc"
 
 #include "qjsky.h"
 
@@ -80,7 +83,7 @@
 #endif
 
 /* the modules made on demand (below) */
-enum { MODULE_SELECTORS, MODULE_NET, MODULE_DOMEXCEPTION, MODULE_COUNT };
+enum { MODULE_SELECTORS, MODULE_NET, MODULE_DOMEXCEPTION, MODULE_WEB, MODULE_COUNT };
 static JSValue module_exports(JSContext *ctx, int m);
 
 /* pointer -> object, one per page for nodes and for events (open
@@ -142,6 +145,7 @@ static const char *const hidden_names[QJSKY_HIDDEN_COUNT] = {
 	[QJSKY_HIDDEN_IMPLEMENTATION] = "implementation",
 	[QJSKY_HIDDEN_CONTEXT2D] = "context2d",
 	[QJSKY_HIDDEN_DATA] = "data",
+	[QJSKY_HIDDEN_SCREEN] = "screen",
 };
 
 static inline jsthread *thread_of(JSContext *ctx)
@@ -774,7 +778,11 @@ static void report_rejections(JSContext *ctx)
 }
 
 /* the jobs (promise reactions) queued run, then the rejections no handler
- * took reported
+ * took reported: a microtask checkpoint, made when the outermost script,
+ * handler or timer returns (the HTML standard's "when the JavaScript stack
+ * is empty").  A listener libdom calls inside a DOM call made by script
+ * (DOMNodeInserted under appendChild) leaves the jobs for later: run
+ * there they changed the DOM in the middle of libdom's change.
  */
 static void run_jobs(JSContext *ctx)
 {
@@ -782,6 +790,9 @@ static void run_jobs(JSContext *ctx)
 	JSContext *job_ctx;
 	int r;
 
+	if (thread_of(ctx)->running > 1) {
+		return;
+	}
 	while ((r = JS_ExecutePendingJob(rt, &job_ctx)) != 0) {
 		if (r < 0) {
 			qjsky_log_exception(job_ctx, "job");
@@ -1782,13 +1793,217 @@ static JSValue js_utf8encode(JSContext *ctx, JSValueConst this_val, int argc,
 	return arr;
 }
 
+/* urlparse(input, base): NetSurf's parse of input (against base when it is
+ * not null) as its parts, or null when it is not a URL
+ */
+static JSValue js_urlparse(JSContext *ctx, JSValueConst this_val, int argc,
+			   JSValueConst *argv)
+{
+	static const struct {
+		const char *name;
+		nsurl_component part;
+	} parts[] = {
+		{ "protocol", NSURL_SCHEME }, { "username", NSURL_USERNAME },
+		{ "password", NSURL_PASSWORD }, { "hostname", NSURL_HOST },
+		{ "port", NSURL_PORT }, { "pathname", NSURL_PATH },
+		{ "search", NSURL_QUERY }, { "hash", NSURL_FRAGMENT },
+		{ "href", NSURL_WITH_FRAGMENT },
+	};
+	const char *input, *base_s = NULL;
+	nsurl *base = NULL, *url = NULL;
+	nserror err;
+	JSValue ret;
+	size_t i;
+
+	input = JS_ToCString(ctx, argv[0]);
+	if (input == NULL) {
+		return JS_EXCEPTION;
+	}
+	if (argc > 1 && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) {
+		base_s = JS_ToCString(ctx, argv[1]);
+		if (base_s == NULL) {
+			JS_FreeCString(ctx, input);
+			return JS_EXCEPTION;
+		}
+	}
+	if (base_s != NULL) {
+		err = nsurl_create(base_s, &base);
+		if (err == NSERROR_OK) {
+			err = nsurl_join(base, input, &url);
+			nsurl_unref(base);
+		}
+	} else {
+		err = nsurl_create(input, &url);
+	}
+	JS_FreeCString(ctx, input);
+	JS_FreeCString(ctx, base_s);
+	if (err != NSERROR_OK) {
+		return JS_NULL;
+	}
+	ret = JS_NewObject(ctx);
+	for (i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+		char *v = NULL;
+		size_t len = 0;
+		JSValue str;
+		if (nsurl_get(url, parts[i].part, &v, &len) == NSERROR_OK && v != NULL) {
+			str = JS_NewStringLen(ctx, v, len);
+		} else {
+			str = JS_NewString(ctx, "");
+		}
+		free(v);
+		JS_SetPropertyStr(ctx, ret, parts[i].name, str);
+	}
+	nsurl_unref(url);
+	return ret;
+}
+
 /* what net.js gets (its argument: never on the global) */
 static const JSCFunctionListEntry js_natives[] = {
 	JS_CFUNC_DEF("fetch", 5, js_nsfetch),
 	JS_CFUNC_DEF("abort", 1, js_nsfetch_abort),
 	JS_CFUNC_DEF("utf8decode", 1, js_utf8decode),
 	JS_CFUNC_DEF("utf8encode", 1, js_utf8encode),
+	JS_CFUNC_DEF("urlparse", 2, js_urlparse),
 };
+
+/* iface(name): an interface object as the bindings make it (whatever the
+ * global of that name is now), or null
+ */
+static JSValue js_iface(JSContext *ctx, JSValueConst this_val, int argc,
+			JSValueConst *argv)
+{
+	const char *name = JS_ToCString(ctx, argv[0]);
+	JSValue ret = JS_NULL;
+	int i;
+
+	if (name == NULL) {
+		return JS_EXCEPTION;
+	}
+	for (i = 0; i < QJSKY_CLASS_COUNT; i++) {
+		if (strcmp(qjsky_classes[i]->name, name) == 0) {
+			ret = qjsky_interface_object(ctx, qjsky_classes[i]);
+			break;
+		}
+	}
+	JS_FreeCString(ctx, name);
+	return ret;
+}
+
+/* whether a dom string is the C string s */
+static bool dom_string_is(dom_string *str, const char *s)
+{
+	size_t n = strlen(s);
+	return dom_string_byte_length(str) == n &&
+		memcmp(dom_string_data(str), s, n) == 0;
+}
+
+/* mutation(event): a mutation event's details (relatedNode, prevValue,
+ * newValue, attrName, attrChange), or null for another event
+ */
+static JSValue js_mutation(JSContext *ctx, JSValueConst this_val, int argc,
+			   JSValueConst *argv)
+{
+	event_private_t *priv = qjsky_get_private(argv[0], &qjsky_class_event);
+	dom_mutation_event *evt;
+	dom_string *type = NULL, *str = NULL;
+	dom_node *node = NULL;
+	dom_mutation_type change;
+	bool mutation;
+	JSValue ret;
+
+	if (priv == NULL || priv->evt == NULL ||
+	    dom_event_get_type(priv->evt, &type) != DOM_NO_ERR || type == NULL) {
+		return JS_NULL;
+	}
+	mutation = dom_string_is(type, "DOMNodeInserted") ||
+		dom_string_is(type, "DOMNodeRemoved") ||
+		dom_string_is(type, "DOMAttrModified") ||
+		dom_string_is(type, "DOMCharacterDataModified");
+	dom_string_unref(type);
+	if (!mutation) {
+		return JS_NULL;
+	}
+	evt = (dom_mutation_event *)priv->evt;
+	ret = JS_NewObject(ctx);
+	if (dom_mutation_event_get_related_node(evt, &node) == DOM_NO_ERR) {
+		JS_SetPropertyStr(ctx, ret, "relatedNode", qjsky_node(ctx, node));
+		if (node != NULL) {
+			dom_node_unref(node);
+		}
+	}
+	if (dom_mutation_event_get_prev_value(evt, &str) == DOM_NO_ERR && str != NULL) {
+		JS_SetPropertyStr(ctx, ret, "prevValue", qjsky_string(ctx, str));
+		dom_string_unref(str);
+	}
+	str = NULL;
+	if (dom_mutation_event_get_new_value(evt, &str) == DOM_NO_ERR && str != NULL) {
+		JS_SetPropertyStr(ctx, ret, "newValue", qjsky_string(ctx, str));
+		dom_string_unref(str);
+	}
+	str = NULL;
+	if (dom_mutation_event_get_attr_name(evt, &str) == DOM_NO_ERR && str != NULL) {
+		JS_SetPropertyStr(ctx, ret, "attrName", qjsky_string(ctx, str));
+		dom_string_unref(str);
+	}
+	if (dom_mutation_event_get_attr_change(evt, &change) == DOM_NO_ERR) {
+		JS_SetPropertyStr(ctx, ret, "attrChange", JS_NewInt32(ctx, change));
+	}
+	return ret;
+}
+
+/* what web.js gets */
+static const JSCFunctionListEntry web_natives[] = {
+	JS_CFUNC_DEF("iface", 1, js_iface),
+	JS_CFUNC_DEF("mutation", 1, js_mutation),
+};
+
+/* exported interface documented in qjsky.h */
+bool qjsky_node_box(struct dom_node *node, int *x, int *y, int *width,
+		    int *height, struct box **out)
+{
+	struct box *box = NULL;
+	int bx, by;
+
+	if (node == NULL ||
+	    dom_node_get_user_data(node, corestring_dom___ns_key_box_node_data,
+				   (void *)&box) != DOM_NO_ERR || box == NULL ||
+	    box->width == UNKNOWN_WIDTH || box->height < 0) {
+		return false;
+	}
+	box_coords(box, &bx, &by);
+	/* (a box's x and y are its padding edge) */
+	*x = bx - box->border[LEFT].width;
+	*y = by - box->border[TOP].width;
+	*width = box->border[LEFT].width + box->padding[LEFT] + box->width +
+		box->padding[RIGHT] + box->border[RIGHT].width;
+	*height = box->border[TOP].width + box->padding[TOP] + box->height +
+		box->padding[BOTTOM] + box->border[BOTTOM].width;
+	if (out != NULL) {
+		*out = box;
+	}
+	return true;
+}
+
+/* exported interface documented in qjsky.h */
+JSValue qjsky_dom_rect(JSContext *ctx, double x, double y, double width,
+		       double height)
+{
+	JSValue exports = module_exports(ctx, MODULE_WEB), ctor, ret;
+	JSValue args[4];
+
+	if (JS_IsException(exports)) {
+		return exports;
+	}
+	ctor = JS_GetPropertyStr(ctx, exports, "DOMRect");
+	JS_FreeValue(ctx, exports);
+	args[0] = JS_NewFloat64(ctx, x);
+	args[1] = JS_NewFloat64(ctx, y);
+	args[2] = JS_NewFloat64(ctx, width);
+	args[3] = JS_NewFloat64(ctx, height);
+	ret = JS_CallConstructor(ctx, ctor, 4, (JSValueConst *)args);
+	JS_FreeValue(ctx, ctor);
+	return ret;
+}
 
 /*** modules on demand: JavaScript a page pays for when it first names one
  * of its exports (a lazy property of the global or a prototype)
@@ -1798,11 +2013,15 @@ static const struct {
 	const char *name;
 	const unsigned char *src;
 	const unsigned int *len;
-	bool natives;	/* called with the natives */
+	const JSCFunctionListEntry *natives;	/* its argument's (or none) */
+	int n_natives;
 } modules[MODULE_COUNT] = {
-	[MODULE_SELECTORS] = { "selectors.js", selectors_js, &selectors_js_len, false },
-	[MODULE_NET] = { "net.js", net_js, &net_js_len, true },
-	[MODULE_DOMEXCEPTION] = { "domexception.js", domexception_js, &domexception_js_len, false },
+	[MODULE_SELECTORS] = { "selectors.js", selectors_js, &selectors_js_len, NULL, 0 },
+	[MODULE_NET] = { "net.js", net_js, &net_js_len, js_natives,
+			 sizeof(js_natives) / sizeof(js_natives[0]) },
+	[MODULE_DOMEXCEPTION] = { "domexception.js", domexception_js, &domexception_js_len, NULL, 0 },
+	[MODULE_WEB] = { "web.js", web_js, &web_js_len, web_natives,
+			 sizeof(web_natives) / sizeof(web_natives[0]) },
 };
 
 /* a module's exports (made the first time: its source evaluated, the
@@ -1830,12 +2049,12 @@ static JSValue module_exports(JSContext *ctx, int m)
 	if (JS_IsException(fn)) {
 		return fn;
 	}
-	if (modules[m].natives) {
+	if (modules[m].natives != NULL) {
 		arg = JS_NewObject(ctx);
-		JS_SetPropertyFunctionList(ctx, arg, js_natives,
-					   sizeof(js_natives) / sizeof(js_natives[0]));
+		JS_SetPropertyFunctionList(ctx, arg, modules[m].natives,
+					   modules[m].n_natives);
 	}
-	exports = JS_Call(ctx, fn, JS_UNDEFINED, modules[m].natives ? 1 : 0,
+	exports = JS_Call(ctx, fn, JS_UNDEFINED, modules[m].natives != NULL ? 1 : 0,
 			  (JSValueConst *)&arg);
 	JS_FreeValue(ctx, arg);
 	JS_FreeValue(ctx, fn);
@@ -1866,12 +2085,19 @@ static JSValue module_export(JSContext *ctx, const JSCFunctionListEntry *e)
 #define NET(n) JS_LAZY_DEF(n, module_export, (void *)(intptr_t)MODULE_NET, MODULE_ATTRS)
 #define SEL(n) JS_LAZY_DEF(n, module_export, (void *)(intptr_t)MODULE_SELECTORS, METHOD_ATTRS)
 #define DEX(n) JS_LAZY_DEF(n, module_export, (void *)(intptr_t)MODULE_DOMEXCEPTION, MODULE_ATTRS)
+#define WEB(n) JS_LAZY_DEF(n, module_export, (void *)(intptr_t)MODULE_WEB, MODULE_ATTRS)
 
 static const JSCFunctionListEntry net_globals[] = {
 	DEX("DOMException"),
 	NET("XMLHttpRequest"), NET("fetch"), NET("Headers"), NET("Request"),
 	NET("Response"), NET("AbortController"), NET("AbortSignal"),
-	NET("TextEncoder"), NET("TextDecoder"), NET("URLSearchParams"),
+	NET("TextEncoder"), NET("TextDecoder"), NET("URLSearchParams"), NET("URL"),
+	WEB("DOMRect"), WEB("DOMRectReadOnly"), WEB("Text"), WEB("Comment"),
+	WEB("DocumentFragment"), WEB("Image"), WEB("Option"), WEB("UIEvent"),
+	WEB("FocusEvent"), WEB("MouseEvent"), WEB("WheelEvent"), WEB("PointerEvent"),
+	WEB("KeyboardEvent"), WEB("InputEvent"), WEB("MutationObserver"),
+	WEB("MutationRecord"), WEB("IntersectionObserver"), WEB("ResizeObserver"),
+	WEB("Blob"), WEB("File"), WEB("FileReader"), WEB("FormData"), WEB("DOMParser"),
 };
 
 static const JSCFunctionListEntry element_selectors[] = {

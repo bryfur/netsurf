@@ -33,6 +33,8 @@
 #include <quickjs.h>
 #include <dom/dom.h>
 
+struct box;
+
 /* addEventListener's options */
 typedef enum {
 	ELF_CAPTURE = 1 << 0,
@@ -59,6 +61,7 @@ enum qjsky_hidden {
 	QJSKY_HIDDEN_IMPLEMENTATION,
 	QJSKY_HIDDEN_CONTEXT2D,
 	QJSKY_HIDDEN_DATA,
+	QJSKY_HIDDEN_SCREEN,
 	QJSKY_HIDDEN_COUNT
 };
 
@@ -164,6 +167,24 @@ void qjsky_log_exception(JSContext *ctx, const char *what);
 
 /** The page's script timeout restarted (scripts run at most 10 s) */
 void qjsky_reset_timeout(JSContext *ctx);
+
+/**
+ * The window's viewport (its size in pixels and how far it is scrolled; 0
+ * when the page has no window) and the window scrolled to (x, y)
+ */
+void qjsky_viewport(JSContext *ctx, int *width, int *height, int *sx, int *sy);
+void qjsky_scroll_to(JSContext *ctx, int x, int y);
+
+/**
+ * An element's border box in document coordinates from the layout: false
+ * when it has none (not rendered, or the page not laid out yet)
+ */
+bool qjsky_node_box(struct dom_node *node, int *x, int *y, int *width,
+		    int *height, struct box **box);
+
+/** A DOMRect (web.js's) of x, y, width, height: a new reference */
+JSValue qjsky_dom_rect(JSContext *ctx, double x, double y, double width,
+		       double height);
 
 /** The Window's private struct, its browsing context's closing down */
 void qjsky_window_closedown(JSContext *ctx, void *window);

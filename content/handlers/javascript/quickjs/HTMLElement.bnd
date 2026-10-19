@@ -11,6 +11,91 @@
 prologue HTMLElement()
 %{
 #include <utils/corestrings.h>
+#include "html/box.h"
+
+/* an element's offset parent (the nearest positioned ancestor, table cell
+ * or table, else the body): NULL when it has none (not rendered, fixed, the
+ * body or the root); a new reference
+ */
+static dom_node *html_element_offset_parent(dom_node *node)
+{
+	int x, y, w, h;
+	struct box *box;
+	dom_node *n = NULL, *next;
+	dom_string *name;
+
+	if (!qjsky_node_box(node, &x, &y, &w, &h, &box) || box->style == NULL ||
+	    css_computed_position(box->style) == CSS_POSITION_FIXED) {
+		return NULL;
+	}
+	if (dom_node_get_node_name(node, &name) == DOM_NO_ERR && name != NULL) {
+		bool root = dom_string_caseless_lwc_isequal(name, corestring_lwc_body) ||
+			dom_string_caseless_lwc_isequal(name, corestring_lwc_html);
+		dom_string_unref(name);
+		if (root) {
+			return NULL;
+		}
+	}
+	if (dom_node_get_parent_node(node, &n) != DOM_NO_ERR) {
+		return NULL;
+	}
+	while (n != NULL) {
+		dom_node_type type;
+		bool found = false;
+		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR || type != DOM_ELEMENT_NODE) {
+			dom_node_unref(n);
+			return NULL;
+		}
+		if (dom_node_get_node_name(n, &name) == DOM_NO_ERR && name != NULL) {
+			found = dom_string_caseless_lwc_isequal(name, corestring_lwc_body) ||
+				dom_string_caseless_lwc_isequal(name, corestring_lwc_td) ||
+				dom_string_caseless_lwc_isequal(name, corestring_lwc_th) ||
+				dom_string_caseless_lwc_isequal(name, corestring_lwc_table);
+			dom_string_unref(name);
+		}
+		if (!found && qjsky_node_box(n, &x, &y, &w, &h, &box) && box->style != NULL &&
+		    css_computed_position(box->style) != CSS_POSITION_STATIC) {
+			found = true;
+		}
+		if (found) {
+			return n;
+		}
+		next = NULL;
+		dom_node_get_parent_node(n, &next);
+		dom_node_unref(n);
+		n = next;
+	}
+	return NULL;
+}
+
+/* an element's border box relative to its offset parent's padding edge
+ * (the document's origin for the body or none)
+ */
+static void html_element_offset(dom_node *node, int *x, int *y)
+{
+	int w, h, px, py, pw, ph;
+	struct box *pbox;
+	dom_node *parent;
+	dom_string *name;
+
+	*x = *y = 0;
+	if (!qjsky_node_box(node, x, y, &w, &h, NULL)) {
+		return;
+	}
+	parent = html_element_offset_parent(node);
+	if (parent == NULL) {
+		return;
+	}
+	if (dom_node_get_node_name(parent, &name) == DOM_NO_ERR && name != NULL) {
+		bool body = dom_string_caseless_lwc_isequal(name, corestring_lwc_body);
+		dom_string_unref(name);
+		if (!body && qjsky_node_box(parent, &px, &py, &pw, &ph, &pbox)) {
+			*x -= px + pbox->border[LEFT].width;
+			*y -= py + pbox->border[TOP].width;
+		}
+	}
+	dom_node_unref(parent);
+}
 %}
 
 init HTMLElement(struct dom_html_element *html_element::element);
@@ -170,4 +255,48 @@ getter HTMLElement::style()
 		return JS_EXCEPTION;
 	}
 	return style;
+%}
+
+/* CSSOM View: the layout's offsets */
+
+getter HTMLElement::offsetParent()
+%{
+	dom_node *parent = html_element_offset_parent(((node_private_t *)priv)->node);
+	JSValue ret = qjsky_node(ctx, parent);
+	if (parent != NULL) {
+		dom_node_unref(parent);
+	}
+	return ret;
+%}
+
+getter HTMLElement::offsetTop()
+%{
+	int x, y;
+	html_element_offset(((node_private_t *)priv)->node, &x, &y);
+	return JS_NewInt32(ctx, y);
+%}
+
+getter HTMLElement::offsetLeft()
+%{
+	int x, y;
+	html_element_offset(((node_private_t *)priv)->node, &x, &y);
+	return JS_NewInt32(ctx, x);
+%}
+
+getter HTMLElement::offsetWidth()
+%{
+	int x, y, w = 0, h = 0;
+	if (!qjsky_node_box(((node_private_t *)priv)->node, &x, &y, &w, &h, NULL)) {
+		w = 0;
+	}
+	return JS_NewInt32(ctx, w);
+%}
+
+getter HTMLElement::offsetHeight()
+%{
+	int x, y, w = 0, h = 0;
+	if (!qjsky_node_box(((node_private_t *)priv)->node, &x, &y, &w, &h, NULL)) {
+		h = 0;
+	}
+	return JS_NewInt32(ctx, h);
 %}

@@ -170,7 +170,8 @@ DOMSettableTokenList.prototype.toString = DOMTokenList.prototype.toString;
 	}
 	return out;
     }
-    [Element.prototype, Document.prototype, DocumentFragment.prototype].forEach(function (p) {
+    /* (DocumentFragment from an instance: the global is web.js's, made on demand) */
+    [Element.prototype, Document.prototype, Object.getPrototypeOf(document.createDocumentFragment())].forEach(function (p) {
 	if (!Object.getOwnPropertyDescriptor(p, "children")) getter(p, "children", elementChildren);
 	method(p, "append", function () {
 	    this.appendChild(nodesOf(this.ownerDocument || this, arguments));

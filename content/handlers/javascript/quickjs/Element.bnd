@@ -12,6 +12,41 @@ class Element {
 	prologue %{
 #include <utils/corestrings.h>
 #include <dom/bindings/hubbub/parser.h>
+#include "html/box.h"
+
+/* the document element (1), the body (2) or another element (0): the
+ * first two scroll with the window
+ */
+static int element_scrolls_window(dom_node *node)
+{
+	dom_node *parent = NULL;
+	dom_node_type type;
+	dom_string *name = NULL;
+	int ret = 0;
+
+	if (dom_node_get_parent_node(node, &parent) != DOM_NO_ERR || parent == NULL) {
+		return 0;
+	}
+	if (dom_node_get_node_type(parent, &type) == DOM_NO_ERR &&
+	    type == DOM_DOCUMENT_NODE) {
+		ret = 1;
+	} else if (dom_node_get_node_name(node, &name) == DOM_NO_ERR && name != NULL) {
+		if (dom_string_caseless_lwc_isequal(name, corestring_lwc_body)) {
+			dom_node *grand = NULL;
+			if (dom_node_get_parent_node(parent, &grand) == DOM_NO_ERR &&
+			    grand != NULL) {
+				if (dom_node_get_node_type(grand, &type) == DOM_NO_ERR &&
+				    type == DOM_DOCUMENT_NODE) {
+					ret = 2;
+				}
+				dom_node_unref(grand);
+			}
+		}
+		dom_string_unref(name);
+	}
+	dom_node_unref(parent);
+	return ret;
+}
 
 typedef dom_exception (*element_step_t)(dom_node *node, dom_node **result);
 
@@ -448,4 +483,190 @@ getter Element::attributes()
 		return JS_EXCEPTION;
 	}
 	return map;
+%}
+
+/* CSSOM View: the layout's geometry */
+
+method Element::getBoundingClientRect()
+%{
+	int x, y, w, h, vw, vh, sx, sy;
+
+	qjsky_viewport(ctx, &vw, &vh, &sx, &sy);
+	if (!qjsky_node_box(((node_private_t *)priv)->node, &x, &y, &w, &h, NULL)) {
+		return qjsky_dom_rect(ctx, 0, 0, 0, 0);
+	}
+	return qjsky_dom_rect(ctx, x - sx, y - sy, w, h);
+%}
+
+method Element::getClientRects()
+%{
+	int x, y, w, h, vw, vh, sx, sy;
+	JSValue list = JS_NewArray(ctx), rect;
+
+	if (JS_IsException(list)) {
+		return list;
+	}
+	qjsky_viewport(ctx, &vw, &vh, &sx, &sy);
+	if (qjsky_node_box(((node_private_t *)priv)->node, &x, &y, &w, &h, NULL)) {
+		rect = qjsky_dom_rect(ctx, x - sx, y - sy, w, h);
+		if (JS_IsException(rect)) {
+			JS_FreeValue(ctx, list);
+			return rect;
+		}
+		JS_SetPropertyUint32(ctx, list, 0, rect);
+	}
+	return list;
+%}
+
+method Element::scrollIntoView()
+%{
+	int x, y, w, h, vw, vh, sx, sy;
+	bool top = argc < 1 || !JS_IsBool(argv[0]) || JS_ToBool(ctx, argv[0]);
+
+	if (argc > 0 && JS_IsObject(argv[0])) {
+		JSValue block = JS_GetPropertyStr(ctx, argv[0], "block");
+		const char *b = JS_IsUndefined(block) ? NULL : JS_ToCString(ctx, block);
+		top = b == NULL || strcmp(b, "end") != 0;
+		JS_FreeCString(ctx, b);
+		JS_FreeValue(ctx, block);
+	}
+	qjsky_viewport(ctx, &vw, &vh, &sx, &sy);
+	if (qjsky_node_box(((node_private_t *)priv)->node, &x, &y, &w, &h, NULL)) {
+		qjsky_scroll_to(ctx, sx, top ? y : y + h - vh);
+	}
+	return JS_UNDEFINED;
+%}
+
+getter Element::scrollTop()
+%{
+	int vw, vh, sx, sy;
+	if (element_scrolls_window(((node_private_t *)priv)->node) == 0) {
+		return JS_NewInt32(ctx, 0);
+	}
+	qjsky_viewport(ctx, &vw, &vh, &sx, &sy);
+	return JS_NewInt32(ctx, sy);
+%}
+
+setter Element::scrollTop()
+%{
+	int vw, vh, sx, sy;
+	double v;
+	if (JS_ToFloat64(ctx, &v, val) < 0) {
+		return JS_EXCEPTION;
+	}
+	if (element_scrolls_window(((node_private_t *)priv)->node) != 0 && v == v) {
+		qjsky_viewport(ctx, &vw, &vh, &sx, &sy);
+		qjsky_scroll_to(ctx, sx, (int)v);
+	}
+	return JS_UNDEFINED;
+%}
+
+getter Element::scrollLeft()
+%{
+	int vw, vh, sx, sy;
+	if (element_scrolls_window(((node_private_t *)priv)->node) == 0) {
+		return JS_NewInt32(ctx, 0);
+	}
+	qjsky_viewport(ctx, &vw, &vh, &sx, &sy);
+	return JS_NewInt32(ctx, sx);
+%}
+
+setter Element::scrollLeft()
+%{
+	int vw, vh, sx, sy;
+	double v;
+	if (JS_ToFloat64(ctx, &v, val) < 0) {
+		return JS_EXCEPTION;
+	}
+	if (element_scrolls_window(((node_private_t *)priv)->node) != 0 && v == v) {
+		qjsky_viewport(ctx, &vw, &vh, &sx, &sy);
+		qjsky_scroll_to(ctx, (int)v, sy);
+	}
+	return JS_UNDEFINED;
+%}
+
+getter Element::scrollWidth()
+%{
+	int x, y, w, h, vw, vh, sx, sy;
+	struct box *box;
+	if (!qjsky_node_box(((node_private_t *)priv)->node, &x, &y, &w, &h, &box)) {
+		return JS_NewInt32(ctx, 0);
+	}
+	if (box->descendant_x1 - box->descendant_x0 > w) {
+		w = box->descendant_x1 - box->descendant_x0;
+	}
+	if (element_scrolls_window(((node_private_t *)priv)->node) != 0) {
+		qjsky_viewport(ctx, &vw, &vh, &sx, &sy);
+		if (vw > w) w = vw;
+	}
+	return JS_NewInt32(ctx, w);
+%}
+
+getter Element::scrollHeight()
+%{
+	int x, y, w, h, vw, vh, sx, sy;
+	struct box *box;
+	if (!qjsky_node_box(((node_private_t *)priv)->node, &x, &y, &w, &h, &box)) {
+		return JS_NewInt32(ctx, 0);
+	}
+	if (box->descendant_y1 - box->descendant_y0 > h) {
+		h = box->descendant_y1 - box->descendant_y0;
+	}
+	if (element_scrolls_window(((node_private_t *)priv)->node) != 0) {
+		qjsky_viewport(ctx, &vw, &vh, &sx, &sy);
+		if (vh > h) h = vh;
+	}
+	return JS_NewInt32(ctx, h);
+%}
+
+getter Element::clientTop()
+%{
+	int x, y, w, h;
+	struct box *box;
+	if (!qjsky_node_box(((node_private_t *)priv)->node, &x, &y, &w, &h, &box) ||
+	    box->type == BOX_INLINE) {
+		return JS_NewInt32(ctx, 0);
+	}
+	return JS_NewInt32(ctx, box->border[TOP].width);
+%}
+
+getter Element::clientLeft()
+%{
+	int x, y, w, h;
+	struct box *box;
+	if (!qjsky_node_box(((node_private_t *)priv)->node, &x, &y, &w, &h, &box) ||
+	    box->type == BOX_INLINE) {
+		return JS_NewInt32(ctx, 0);
+	}
+	return JS_NewInt32(ctx, box->border[LEFT].width);
+%}
+
+getter Element::clientWidth()
+%{
+	int x, y, w, h, vw, vh, sx, sy;
+	struct box *box;
+	if (element_scrolls_window(((node_private_t *)priv)->node) == 1) {
+		qjsky_viewport(ctx, &vw, &vh, &sx, &sy);
+		return JS_NewInt32(ctx, vw);
+	}
+	if (!qjsky_node_box(((node_private_t *)priv)->node, &x, &y, &w, &h, &box) ||
+	    box->type == BOX_INLINE) {
+		return JS_NewInt32(ctx, 0);
+	}
+	return JS_NewInt32(ctx, box->padding[LEFT] + box->width + box->padding[RIGHT]);
+%}
+
+getter Element::clientHeight()
+%{
+	int x, y, w, h, vw, vh, sx, sy;
+	struct box *box;
+	if (element_scrolls_window(((node_private_t *)priv)->node) == 1) {
+		qjsky_viewport(ctx, &vw, &vh, &sx, &sy);
+		return JS_NewInt32(ctx, vh);
+	}
+	if (!qjsky_node_box(((node_private_t *)priv)->node, &x, &y, &w, &h, &box) ||
+	    box->type == BOX_INLINE) {
+		return JS_NewInt32(ctx, 0);
+	}
+	return JS_NewInt32(ctx, box->padding[TOP] + box->height + box->padding[BOTTOM]);
 %}

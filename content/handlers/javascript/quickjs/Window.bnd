@@ -23,6 +23,8 @@ class Window {
 #include "html/html.h"
 #include "html/private.h"
 #include "desktop/gui_internal.h"
+#include "desktop/browser_private.h"
+#include "netsurf/window.h"
 #include "netsurf/misc.h"
 #include "utils/ring.h"
 #include "netsurf/inttypes.h"
@@ -244,6 +246,114 @@ static JSValue window_make_navigator(JSContext *ctx, window_private_t *priv)
 	return qjsky_navigator___create(ctx);
 }
 
+/* exported interface documented in qjsky.h */
+void qjsky_viewport(JSContext *ctx, int *width, int *height, int *sx, int *sy)
+{
+	window_private_t *priv = qjsky_global_private(ctx);
+	struct browser_window *bw;
+
+	*width = *height = *sx = *sy = 0;
+	if (priv == NULL) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return;
+	}
+	bw = priv->win;
+	if (bw != NULL && browser_window_get_dimensions(bw, width, height) == NSERROR_OK &&
+	    *width > 0) {
+		if (bw->window != NULL) {
+			guit->window->get_scroll(bw->window, sx, sy);
+		}
+	} else if (priv->htmlc != NULL) {
+		*width = priv->htmlc->base.available_width;
+		*height = priv->htmlc->base.available_height;
+	}
+}
+
+/* exported interface documented in qjsky.h */
+void qjsky_scroll_to(JSContext *ctx, int x, int y)
+{
+	window_private_t *priv = qjsky_global_private(ctx);
+	struct rect r;
+
+	if (priv == NULL) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return;
+	}
+	if (priv->win == NULL || priv->win->window == NULL) {
+		return;
+	}
+	r.x0 = r.x1 = x < 0 ? 0 : x;
+	r.y0 = r.y1 = y < 0 ? 0 : y;
+	guit->window->set_scroll(priv->win->window, &r);
+}
+
+/* scroll(x, y), scroll({left, top}): the position asked for, relative to
+ * (bx, by) for scrollBy; the current one where none is given
+ */
+static JSValue window_scroll(JSContext *ctx, int argc, JSValueConst *argv, bool by)
+{
+	int w, h, sx, sy;
+	double x, y;
+
+	qjsky_viewport(ctx, &w, &h, &sx, &sy);
+	x = by ? 0 : sx;
+	y = by ? 0 : sy;
+	if (argc > 0 && JS_IsObject(argv[0])) {
+		JSValue v = JS_GetPropertyStr(ctx, argv[0], "left");
+		if (!JS_IsUndefined(v) && JS_ToFloat64(ctx, &x, v) < 0) {
+			JS_FreeValue(ctx, v);
+			return JS_EXCEPTION;
+		}
+		JS_FreeValue(ctx, v);
+		v = JS_GetPropertyStr(ctx, argv[0], "top");
+		if (!JS_IsUndefined(v) && JS_ToFloat64(ctx, &y, v) < 0) {
+			JS_FreeValue(ctx, v);
+			return JS_EXCEPTION;
+		}
+		JS_FreeValue(ctx, v);
+	} else {
+		if (argc > 0 && !JS_IsUndefined(argv[0]) && JS_ToFloat64(ctx, &x, argv[0]) < 0) {
+			return JS_EXCEPTION;
+		}
+		if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_ToFloat64(ctx, &y, argv[1]) < 0) {
+			return JS_EXCEPTION;
+		}
+	}
+	if (x != x) x = 0;
+	if (y != y) y = 0;
+	if (by) {
+		x += sx;
+		y += sy;
+	}
+	qjsky_scroll_to(ctx, (int)x, (int)y);
+	return JS_UNDEFINED;
+}
+
+/* the screen: the window's size, 16 bits a pixel (RGB565) */
+static JSValue window_make_screen(JSContext *ctx, window_private_t *priv)
+{
+	JSValue proto = qjsky_proto(ctx, &qjsky_class_screen), obj;
+	int w, h, sx, sy;
+
+	(void)priv;
+	if (JS_IsException(proto)) {
+		return proto;
+	}
+	obj = JS_NewObjectProto(ctx, proto);
+	JS_FreeValue(ctx, proto);
+	if (JS_IsException(obj)) {
+		return obj;
+	}
+	qjsky_viewport(ctx, &w, &h, &sx, &sy);
+	JS_DefinePropertyValueStr(ctx, obj, "width", JS_NewInt32(ctx, w), JS_PROP_ENUMERABLE);
+	JS_DefinePropertyValueStr(ctx, obj, "height", JS_NewInt32(ctx, h), JS_PROP_ENUMERABLE);
+	JS_DefinePropertyValueStr(ctx, obj, "availWidth", JS_NewInt32(ctx, w), JS_PROP_ENUMERABLE);
+	JS_DefinePropertyValueStr(ctx, obj, "availHeight", JS_NewInt32(ctx, h), JS_PROP_ENUMERABLE);
+	JS_DefinePropertyValueStr(ctx, obj, "colorDepth", JS_NewInt32(ctx, 16), JS_PROP_ENUMERABLE);
+	JS_DefinePropertyValueStr(ctx, obj, "pixelDepth", JS_NewInt32(ctx, 16), JS_PROP_ENUMERABLE);
+	return obj;
+}
+
 /* exported interface documented in qjsky.h: the browsing context closes,
  * its timers stop (those running stop when they return)
  */
@@ -346,6 +456,111 @@ getter Window::location()
 getter Window::navigator()
 %{
 	return window_cached(ctx, QJSKY_HIDDEN_NAVIGATOR, window_make_navigator, priv);
+%}
+
+getter Window::screen()
+%{
+	return window_cached(ctx, QJSKY_HIDDEN_SCREEN, window_make_screen, priv);
+%}
+
+getter Window::innerWidth()
+%{
+	int w, h, sx, sy;
+	(void)priv;
+	qjsky_viewport(ctx, &w, &h, &sx, &sy);
+	return JS_NewInt32(ctx, w);
+%}
+
+getter Window::innerHeight()
+%{
+	int w, h, sx, sy;
+	(void)priv;
+	qjsky_viewport(ctx, &w, &h, &sx, &sy);
+	return JS_NewInt32(ctx, h);
+%}
+
+getter Window::outerWidth()
+%{
+	int w, h, sx, sy;
+	(void)priv;
+	qjsky_viewport(ctx, &w, &h, &sx, &sy);
+	return JS_NewInt32(ctx, w);
+%}
+
+getter Window::outerHeight()
+%{
+	int w, h, sx, sy;
+	(void)priv;
+	qjsky_viewport(ctx, &w, &h, &sx, &sy);
+	return JS_NewInt32(ctx, h);
+%}
+
+getter Window::scrollX()
+%{
+	int w, h, sx, sy;
+	(void)priv;
+	qjsky_viewport(ctx, &w, &h, &sx, &sy);
+	return JS_NewInt32(ctx, sx);
+%}
+
+getter Window::pageXOffset()
+%{
+	int w, h, sx, sy;
+	(void)priv;
+	qjsky_viewport(ctx, &w, &h, &sx, &sy);
+	return JS_NewInt32(ctx, sx);
+%}
+
+getter Window::scrollY()
+%{
+	int w, h, sx, sy;
+	(void)priv;
+	qjsky_viewport(ctx, &w, &h, &sx, &sy);
+	return JS_NewInt32(ctx, sy);
+%}
+
+getter Window::pageYOffset()
+%{
+	int w, h, sx, sy;
+	(void)priv;
+	qjsky_viewport(ctx, &w, &h, &sx, &sy);
+	return JS_NewInt32(ctx, sy);
+%}
+
+getter Window::screenX()
+%{
+	(void)priv;
+	return JS_NewInt32(ctx, 0);
+%}
+
+getter Window::screenY()
+%{
+	(void)priv;
+	return JS_NewInt32(ctx, 0);
+%}
+
+getter Window::devicePixelRatio()
+%{
+	(void)priv;
+	return JS_NewFloat64(ctx, 1.0);
+%}
+
+method Window::scroll()
+%{
+	(void)priv;
+	return window_scroll(ctx, argc, argv, false);
+%}
+
+method Window::scrollTo()
+%{
+	(void)priv;
+	return window_scroll(ctx, argc, argv, false);
+%}
+
+method Window::scrollBy()
+%{
+	(void)priv;
+	return window_scroll(ctx, argc, argv, true);
 %}
 
 getter Window::name()

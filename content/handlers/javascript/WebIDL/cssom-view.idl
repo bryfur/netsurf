@@ -1,0 +1,57 @@
+// CSSOM View Module, the part netsurf-ng implements:
+// https://drafts.csswg.org/cssom-view/
+//
+// (DOMRect and DOMRectReadOnly are JavaScript: quickjs/web.js)
+
+partial interface Window {
+  [SameObject, Replaceable] readonly attribute Screen screen;
+
+  // viewport
+  [Replaceable] readonly attribute long innerWidth;
+  [Replaceable] readonly attribute long innerHeight;
+  [Replaceable] readonly attribute double scrollX;
+  [Replaceable] readonly attribute double pageXOffset;
+  [Replaceable] readonly attribute double scrollY;
+  [Replaceable] readonly attribute double pageYOffset;
+  void scroll(optional any x, optional any y);
+  void scrollTo(optional any x, optional any y);
+  void scrollBy(optional any x, optional any y);
+
+  // client
+  [Replaceable] readonly attribute long screenX;
+  [Replaceable] readonly attribute long screenY;
+  [Replaceable] readonly attribute long outerWidth;
+  [Replaceable] readonly attribute long outerHeight;
+  [Replaceable] readonly attribute double devicePixelRatio;
+};
+
+interface Screen {
+  readonly attribute long availWidth;
+  readonly attribute long availHeight;
+  readonly attribute long width;
+  readonly attribute long height;
+  readonly attribute unsigned long colorDepth;
+  readonly attribute unsigned long pixelDepth;
+};
+
+partial interface Element {
+  any getClientRects();
+  any getBoundingClientRect();
+  void scrollIntoView(optional any arg);
+  attribute unrestricted double scrollTop;
+  attribute unrestricted double scrollLeft;
+  readonly attribute long scrollWidth;
+  readonly attribute long scrollHeight;
+  readonly attribute long clientTop;
+  readonly attribute long clientLeft;
+  readonly attribute long clientWidth;
+  readonly attribute long clientHeight;
+};
+
+partial interface HTMLElement {
+  readonly attribute Element? offsetParent;
+  readonly attribute long offsetTop;
+  readonly attribute long offsetLeft;
+  readonly attribute long offsetWidth;
+  readonly attribute long offsetHeight;
+};
