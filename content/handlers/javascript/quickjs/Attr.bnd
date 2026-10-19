@@ -1,0 +1,124 @@
+/* Attr binding for browser using QuickJS-ng and libdom
+ *
+ * Copyright 2026 Bryan Furia <bryan.furia@gmail.com>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+class Attr {
+	private struct dom_attr *attr;
+};
+
+prologue Attr()
+%{
+static JSValue attr_value(JSContext *ctx, attr_private_t *priv)
+{
+	dom_string *value = NULL;
+	dom_exception exc = dom_attr_get_value(priv->attr, &value);
+	return qjsky_string_result(ctx, exc, value, false);
+}
+
+static JSValue attr_set_value(JSContext *ctx, attr_private_t *priv,
+			      JSValueConst val, bool null_empty)
+{
+	dom_string *value;
+	dom_exception exc;
+
+	if (null_empty && JS_IsNull(val)) {
+		exc = dom_string_create((const uint8_t *)"", 0, &value);
+		if (exc != DOM_NO_ERR) {
+			return qjsky_throw_dom(ctx, exc);
+		}
+	} else if (qjsky_dom_string(ctx, val, &value) != DOM_NO_ERR) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_attr_set_value(priv->attr, value);
+	dom_string_unref(value);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+}
+%}
+
+init Attr(struct dom_attr *attr)
+%{
+	priv->attr = attr;
+	dom_node_ref(attr);
+%}
+
+fini Attr()
+%{
+	dom_node_unref(priv->attr);
+%}
+
+getter Attr::namespaceURI()
+%{
+	dom_string *ns = NULL;
+	dom_exception exc = dom_node_get_namespace(priv->attr, &ns);
+	return qjsky_string_result(ctx, exc, ns, true);
+%}
+
+getter Attr::prefix()
+%{
+	dom_string *pfx = NULL;
+	dom_exception exc = dom_node_get_prefix(priv->attr, &pfx);
+	return qjsky_string_result(ctx, exc, pfx, true);
+%}
+
+getter Attr::localName()
+%{
+	dom_string *name = NULL;
+	dom_exception exc = dom_node_get_local_name(priv->attr, &name);
+	return qjsky_string_result(ctx, exc, name, false);
+%}
+
+getter Attr::name()
+%{
+	dom_string *name = NULL;
+	dom_exception exc = dom_attr_get_name(priv->attr, &name);
+	return qjsky_string_result(ctx, exc, name, false);
+%}
+
+getter Attr::value()
+%{
+	return attr_value(ctx, priv);
+%}
+
+setter Attr::value()
+%{
+	return attr_set_value(ctx, priv, val, false);
+%}
+
+getter Attr::nodeValue()
+%{
+	return attr_value(ctx, priv);
+%}
+
+setter Attr::nodeValue()
+%{
+	return attr_set_value(ctx, priv, val, true);
+%}
+
+getter Attr::textContent()
+%{
+	return attr_value(ctx, priv);
+%}
+
+setter Attr::textContent()
+%{
+	return attr_set_value(ctx, priv, val, true);
+%}
+
+getter Attr::ownerElement()
+%{
+	dom_element *owner = NULL;
+	dom_exception exc = dom_attr_get_owner_element(priv->attr, &owner);
+	return qjsky_node_result(ctx, exc, (dom_node *)owner);
+%}
+
+getter Attr::specified()
+%{
+	(void)priv;
+	return JS_TRUE;
+%}

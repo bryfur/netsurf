@@ -197,13 +197,13 @@ method Node::hasChildNodes()
 
 getter Node::childNodes()
 %{
-	JSValue list, proxy, make;
+	JSValue list;
 	dom_nodelist *nlist = NULL;
 	dom_exception exc;
 
-	proxy = qjsky_get_hidden(ctx, this_val, QJSKY_HIDDEN_CHILD_NODES);
-	if (!JS_IsUndefined(proxy)) {
-		return proxy;
+	list = qjsky_get_hidden(ctx, this_val, QJSKY_HIDDEN_CHILD_NODES);
+	if (!JS_IsUndefined(list)) {
+		return list;
 	}
 	exc = dom_node_get_child_nodes(priv->node, &nlist);
 	if (exc != DOM_NO_ERR) {
@@ -211,20 +211,13 @@ getter Node::childNodes()
 	}
 	list = qjsky_node_list___create(ctx, nlist);
 	dom_nodelist_unref(nlist);
-	if (JS_IsException(list)) {
-		return list;
-	}
-	make = qjsky_generic(ctx, "makeListProxy");
-	proxy = JS_Call(ctx, make, JS_UNDEFINED, 1, (JSValueConst *)&list);
-	JS_FreeValue(ctx, make);
-	JS_FreeValue(ctx, list);
-	if (JS_IsException(proxy) ||
+	if (JS_IsException(list) ||
 	    qjsky_set_hidden(ctx, this_val, QJSKY_HIDDEN_CHILD_NODES,
-			     JS_DupValue(ctx, proxy)) < 0) {
-		JS_FreeValue(ctx, proxy);
+			     JS_DupValue(ctx, list)) < 0) {
+		JS_FreeValue(ctx, list);
 		return JS_EXCEPTION;
 	}
-	return proxy;
+	return list;
 %}
 
 getter Node::firstChild()

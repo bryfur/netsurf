@@ -103,23 +103,6 @@ static JSValue element_set_attribute(JSContext *ctx, dom_node *node,
 	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
 }
 
-/* an object of a libdom list made from make, wrapped by a generics.js
- * proxy and kept on this_val; nlist (unref'd here) passed to make
- */
-static JSValue element_list_proxy(JSContext *ctx, JSValue list, const char *proxy_maker)
-{
-	JSValue make, proxy;
-
-	if (JS_IsException(list)) {
-		return list;
-	}
-	make = qjsky_generic(ctx, proxy_maker);
-	proxy = JS_Call(ctx, make, JS_UNDEFINED, 1, (JSValueConst *)&list);
-	JS_FreeValue(ctx, make);
-	JS_FreeValue(ctx, list);
-	return proxy;
-}
-
 %};
 };
 
@@ -191,7 +174,7 @@ method Element::getElementsByTagName()
 	}
 	list = qjsky_node_list___create(ctx, nlist);
 	dom_nodelist_unref(nlist);
-	return element_list_proxy(ctx, list, "makeListProxy");
+	return list;
 %}
 
 getter Element::tagName()
@@ -447,23 +430,22 @@ getter Element::attributes()
 %{
 	dom_namednodemap *nmap = NULL;
 	dom_exception exc;
-	JSValue proxy = qjsky_get_hidden(ctx, this_val, QJSKY_HIDDEN_ATTRIBUTES);
+	JSValue map = qjsky_get_hidden(ctx, this_val, QJSKY_HIDDEN_ATTRIBUTES);
 
-	if (!JS_IsUndefined(proxy)) {
-		return proxy;
+	if (!JS_IsUndefined(map)) {
+		return map;
 	}
 	exc = dom_node_get_attributes(priv->parent.node, &nmap);
 	if (exc != DOM_NO_ERR) {
 		return qjsky_throw_dom(ctx, exc);
 	}
-	proxy = qjsky_named_node_map___create(ctx, nmap);
+	map = qjsky_named_node_map___create(ctx, nmap);
 	dom_namednodemap_unref(nmap);
-	proxy = element_list_proxy(ctx, proxy, "makeNodeMapProxy");
-	if (JS_IsException(proxy) ||
+	if (JS_IsException(map) ||
 	    qjsky_set_hidden(ctx, this_val, QJSKY_HIDDEN_ATTRIBUTES,
-			     JS_DupValue(ctx, proxy)) < 0) {
-		JS_FreeValue(ctx, proxy);
+			     JS_DupValue(ctx, map)) < 0) {
+		JS_FreeValue(ctx, map);
 		return JS_EXCEPTION;
 	}
-	return proxy;
+	return map;
 %}

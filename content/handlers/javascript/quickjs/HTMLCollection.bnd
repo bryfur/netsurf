@@ -22,3 +22,40 @@ fini HTMLCollection()
 %{
 	dom_html_collection_unref(priv->coll);
 %}
+
+getter HTMLCollection::length()
+%{
+	uint32_t len;
+	dom_exception err = dom_html_collection_get_length(priv->coll, &len);
+	if (err != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, err);
+	}
+	return JS_NewUint32(ctx, len);
+%}
+
+method HTMLCollection::item()
+%{
+	uint32_t i;
+	dom_node *node = NULL;
+	dom_exception err;
+
+	if (JS_ToUint32(ctx, &i, argv[0]) < 0) {
+		return JS_EXCEPTION;
+	}
+	err = dom_html_collection_item(priv->coll, i, &node);
+	return qjsky_node_result(ctx, err, node);
+%}
+
+method HTMLCollection::namedItem()
+%{
+	dom_node *node = NULL;
+	dom_string *name;
+	dom_exception err;
+
+	if (qjsky_dom_string(ctx, argv[0], &name) != DOM_NO_ERR) {
+		return JS_EXCEPTION;
+	}
+	err = dom_html_collection_named_item(priv->coll, name, &node);
+	dom_string_unref(name);
+	return qjsky_node_result(ctx, err, node);
+%}

@@ -536,6 +536,9 @@ static const qjsky_class_t *node_class(struct dom_node *node)
 	case DOM_DOCUMENT_NODE:
 		return &qjsky_class_document;
 
+	case DOM_ATTRIBUTE_NODE:
+		return &qjsky_class_attr;
+
 	default:
 		return &qjsky_class_node;
 	}
@@ -844,7 +847,7 @@ static JSValue listeners_for(JSContext *ctx, JSValueConst target,
 	return list;
 }
 
-static int64_t list_length(JSContext *ctx, JSValueConst list)
+static int64_t listener_count(JSContext *ctx, JSValueConst list)
 {
 	int64_t len = 0;
 	if (JS_GetLength(ctx, list, &len) < 0) {
@@ -857,7 +860,7 @@ static int64_t list_length(JSContext *ctx, JSValueConst list)
 static int64_t listener_index(JSContext *ctx, JSValueConst list,
 			      JSValueConst callback, event_listener_flags flags)
 {
-	int64_t len = list_length(ctx, list);
+	int64_t len = listener_count(ctx, list);
 	int64_t i;
 
 	for (i = 0; i < len; i++) {
@@ -904,7 +907,7 @@ int qjsky_listener_add(JSContext *ctx, JSValueConst target, JSValueConst type,
 	}
 	JS_SetPropertyUint32(ctx, entry, 0, JS_DupValue(ctx, callback));
 	JS_SetPropertyUint32(ctx, entry, 1, JS_NewInt32(ctx, flags));
-	len = list_length(ctx, list);
+	len = listener_count(ctx, list);
 	r = JS_SetPropertyInt64(ctx, list, len, entry);
 	JS_FreeValue(ctx, list);
 	if (r < 0) {
@@ -1035,7 +1038,7 @@ static void generic_event_handler(dom_event *evt, void *pw)
 	 * removed ones are marked (entry[2]) and skipped
 	 */
 	copy = JS_NewArray(ctx);
-	len = list_length(ctx, list);
+	len = listener_count(ctx, list);
 	for (i = 0; i < len; i++) {
 		JS_SetPropertyInt64(ctx, copy, i, JS_GetPropertyInt64(ctx, list, i));
 	}

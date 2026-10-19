@@ -55,6 +55,7 @@ struct dom_html_br_element;
 };
 
 #include "EventTarget.bnd"
+#include "Attr.bnd"
 #include "Console.bnd"
 #include "Window.bnd"
 #include "Document.bnd"

@@ -221,7 +221,7 @@ method Document::getElementsByTagName()
 	dom_nodelist *nodes = NULL;
 	dom_exception err;
 	dom_string *tag = document_string_arg(ctx, argv[0]);
-	JSValue list, make, proxy;
+	JSValue list;
 
 	if (tag == NULL) {
 		return JS_EXCEPTION;
@@ -234,14 +234,7 @@ method Document::getElementsByTagName()
 	}
 	list = qjsky_node_list___create(ctx, nodes);
 	dom_nodelist_unref(nodes);
-	if (JS_IsException(list)) {
-		return list;
-	}
-	make = qjsky_generic(ctx, "makeListProxy");
-	proxy = JS_Call(ctx, make, JS_UNDEFINED, 1, (JSValueConst *)&list);
-	JS_FreeValue(ctx, make);
-	JS_FreeValue(ctx, list);
-	return proxy;
+	return list;
 %}
 
 getter Document::cookie()

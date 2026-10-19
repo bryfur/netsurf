@@ -8,62 +8,6 @@
  */
 
 var NetSurf = {
-    /* The make-proxy call for list-type objects */
-    makeListProxy: function(inner) {
-	/* property keys are strings: an index is a canonical number */
-	function index(key) {
-	    return (typeof key == 'string' && /^(0|[1-9][0-9]*)$/.test(key)) ? Number(key) : -1;
-	}
-	return new Proxy(inner, {
-	    has: function(target, key) {
-		var i = index(key);
-		if (i >= 0) {
-		    return i < target.length;
-		} else {
-		    return key in target;
-		}
-	    },
-	    get: function(target, key) {
-		var i = index(key);
-		if (i >= 0) {
-		    return i < target.length ? target.item(i) : undefined;
-		} else {
-		    var v = target[key];
-		    return typeof v == 'function' ? v.bind(target) : v;
-		}
-	    },
-	});
-    },
-    /* The make-proxy call for nodemap-type objects */
-    makeNodeMapProxy: function(inner) {
-	function index(key) {
-	    return (typeof key == 'string' && /^(0|[1-9][0-9]*)$/.test(key)) ? Number(key) : -1;
-	}
-	return new Proxy(inner, {
-	    has: function(target, key) {
-		var i = index(key);
-		if (i >= 0) {
-		    return i < target.length;
-		} else {
-		    return (typeof key == 'string' && target.getNamedItem(key)) || (key in target);
-		}
-	    },
-	    get: function(target, key) {
-		var i = index(key);
-		if (i >= 0) {
-		    return i < target.length ? target.item(i) : undefined;
-		} else if (typeof key != 'string') {
-		    return target[key];
-		} else {
-		    var attr = target.getNamedItem(key);
-		    if (attr) {
-			return attr;
-		    }
-		    return target[key];
-		}
-	    },
-	});
-    },
     consoleFormatter: function Formatter() {
 
 	if (arguments.length == 0) {
