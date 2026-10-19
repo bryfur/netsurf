@@ -22,6 +22,7 @@
  * Implementation of HTML content handling.
  */
 
+#include <time.h>
 #include <assert.h>
 #include <stdint.h>
 #include <string.h>
@@ -425,8 +426,30 @@ void html_finish_conversion(html_content *htmlc)
 
 static void html_rebuild_cb(void *p);
 
+static unsigned rebuild_count, rebuild_total_ms;
+
+static uint64_t rebuild_now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* exported function documented in html/private.h */
+void html_rebuild_stats(unsigned *count, unsigned *ms)
+{
+	*count = rebuild_count;
+	*ms = rebuild_total_ms;
+}
+
+/* a rebuild after ms, or after as long as the last one took (a page that
+ * changes all the time is laid out at most about half the time)
+ */
 static void html_rebuild_schedule(html_content *htmlc, int ms)
 {
+	if (ms < (int)htmlc->rebuild_last_ms) {
+		ms = (int)htmlc->rebuild_last_ms;
+	}
 	if (!htmlc->rebuild_scheduled) {
 		htmlc->rebuild_scheduled = true;
 		guit->misc->schedule(ms, html_rebuild_cb, htmlc);
@@ -511,13 +534,17 @@ static void html_rebuild_done(html_content *c, bool success)
 
 	html_rebuild_free_old(c, old_layout);
 
-	NSLOG(netsurf, INFO, "Box tree rebuilt (content %p)", c);
 	if ((content__get_status(&c->base) == CONTENT_STATUS_READY ||
 	     content__get_status(&c->base) == CONTENT_STATUS_DONE) &&
 	    c->base.available_width > 0) {
 		content__reformat(&c->base, false, c->base.available_width,
 				  c->base.available_height);
 	}
+	c->rebuild_last_ms = (unsigned)(rebuild_now_ms() - c->rebuild_start_ms);
+	rebuild_count++;
+	rebuild_total_ms += c->rebuild_last_ms;
+	NSLOG(netsurf, INFO, "Box tree rebuilt (content %p) in %u ms", c,
+	      c->rebuild_last_ms);
 	if (c->dom_dirty) {
 		html_rebuild_schedule(c, 10);
 	}
@@ -555,6 +582,7 @@ static void html_rebuild_cb(void *p)
 	}
 
 	/* the new tree in a context of its own, with objects of its own */
+	htmlc->rebuild_start_ms = rebuild_now_ms();
 	htmlc->rebuild_old_bctx = htmlc->bctx;
 	htmlc->rebuild_old_objects = htmlc->object_list;
 	htmlc->rebuild_old_layout = htmlc->layout;

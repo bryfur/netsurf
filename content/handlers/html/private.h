@@ -149,6 +149,11 @@ typedef struct html_content {
 	int *rebuild_old_bctx;
 	struct content_html_object *rebuild_old_objects;
 	struct box *rebuild_old_layout;
+	/** When the rebuild under way began, how long the last took (ms):
+	 * the next waits at least that long
+	 */
+	uint64_t rebuild_start_ms;
+	unsigned rebuild_last_ms;
 	/** Document background colour. */
 	colour background_colour;
 
@@ -253,6 +258,12 @@ void html_finish_conversion(html_content *htmlc);
  * of changes)
  */
 void html_dom_mutated(html_content *htmlc);
+
+/**
+ * The box tree rebuilds done since NetSurf started and the time they took
+ * (conversion and reformat, ms)
+ */
+void html_rebuild_stats(unsigned *count, unsigned *ms);
 
 
 /**
