@@ -183,6 +183,13 @@ bool qjsky_node_box(struct dom_node *node, int *x, int *y, int *width,
 		    int *height, struct box **box);
 
 /** A DOMRect (web.js's) of x, y, width, height: a new reference */
+/* A program's natives for a page (netsurf-ng as an app runtime, Photon):
+ * called with each page's new context (the Window, the polyfills made) and
+ * its URL; < 0 a failure (logged).  NULL: none.
+ */
+typedef int (*qjsky_native_hook_t)(JSContext *ctx, const char *url);
+extern qjsky_native_hook_t qjsky_native_hook;
+
 JSValue qjsky_style_declaration(JSContext *ctx, JSValueConst element);
 JSValue qjsky_dom_rect(JSContext *ctx, double x, double y, double width,
 		       double height);

@@ -46,6 +46,7 @@
 #include "content/llcache.h"
 #include "desktop/gui_internal.h"
 #include "utils/nsurl.h"
+#include "content/content_protected.h"
 #include "html/private.h"
 #include "html/box.h"
 #include "html/box_inspect.h"
@@ -2422,6 +2423,9 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv, jsthread **th
 	return NSERROR_OK;
 }
 
+/* exported interface documented in qjsky.h */
+qjsky_native_hook_t qjsky_native_hook;
+
 /* a page's context, made the first time (the Window, the polyfills): NULL
  * if it cannot be
  */
@@ -2487,6 +2491,15 @@ static JSContext *thread_context(jsthread *thread)
 		goto fail;
 	}
 	mem_report(rt, "polyfills");
+
+	/* the program's own natives for the page (an app runtime's, for its
+	 * own pages: it decides by the URL)
+	 */
+	if (qjsky_native_hook != NULL && thread->doc_priv != NULL &&
+	    content_get_url(thread->doc_priv) != NULL &&
+	    qjsky_native_hook(ctx, nsurl_access(content_get_url(thread->doc_priv))) < 0) {
+		NSLOG(netsurf, ERROR, "the program's natives for the page failed");
+	}
 	thread->generics = JS_GetPropertyStr(ctx, global, "NetSurf");
 	{
 		JSAtom atom = JS_NewAtom(ctx, "NetSurf");
