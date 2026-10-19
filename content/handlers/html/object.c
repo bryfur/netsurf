@@ -152,6 +152,68 @@ html_object_nobox_callback(hlcache_handle *object,
 
 
 /**
+ * A reformat for the objects that became ready since the last one: one,
+ * when the time NetSurf leaves between reformats (three times the last
+ * one's) has passed, not one per object.  A page whose layout takes a
+ * second was laid out again for every picture that arrived (Wikipedia's
+ * article: 20 s in one batch of pictures on a 150 MHz board).  A page laid
+ * out in less than 50 ms is, as before, at once.
+ */
+static int html_object_reformats;	/* pending, all contents' */
+
+void html_object_reformat_cancel(html_content *c);
+
+static void html_object_reformat_cb(void *p)
+{
+	html_content *c = p;
+
+	c->object_reformat_pending = false;
+	html_object_reformats--;
+	if (c->base.status == CONTENT_STATUS_READY ||
+	    c->base.status == CONTENT_STATUS_DONE) {
+		content__reformat(&c->base, false, c->base.available_width,
+				c->base.available_height);
+	}
+}
+
+/**
+ * Reformat now if the minimum time between reformats has passed, else
+ * once it has.
+ */
+static void html_object_reformat(html_content *c)
+{
+	uint64_t ms_now;
+
+	nsu_getmonotonic_ms(&ms_now);
+	if (ms_now > c->base.reformat_time || c->layout_ms < 50) {
+		html_object_reformat_cancel(c);
+		content__reformat(&c->base, false, c->base.available_width,
+				c->base.available_height);
+	} else if (!c->object_reformat_pending) {
+		c->object_reformat_pending = true;
+		html_object_reformats++;
+		guit->misc->schedule(c->base.reformat_time - ms_now,
+				html_object_reformat_cb, c);
+	}
+}
+
+/* exported interface documented in html/object.h */
+int html_object_reformats_pending(void)
+{
+	return html_object_reformats;
+}
+
+/* exported interface documented in html/object.h */
+void html_object_reformat_cancel(html_content *c)
+{
+	if (c->object_reformat_pending) {
+		c->object_reformat_pending = false;
+		html_object_reformats--;
+		guit->misc->schedule(-1, html_object_reformat_cb, c);
+	}
+}
+
+/**
  * Callback for hlcache_handle_retrieve() for objects with a box.
  */
 static nserror
@@ -187,9 +249,7 @@ html_object_callback(hlcache_handle *object,
 			html_object_done(box, object, o->background);
 			if (c->base.status == CONTENT_STATUS_READY ||
 					c->base.status == CONTENT_STATUS_DONE)
-				content__reformat(&c->base, false,
-						c->base.available_width,
-						c->base.available_height);
+				html_object_reformat(c);
 		}
 		break;
 
@@ -479,6 +539,7 @@ html_object_callback(hlcache_handle *object,
 	     event->type == CONTENT_MSG_DONE ||
 	     event->type == CONTENT_MSG_ERROR)) {
 		/* all objects have arrived */
+		html_object_reformat_cancel(c);
 		content__reformat(&c->base, false, c->base.available_width,
 				c->base.available_height);
 		content_set_done(&c->base);

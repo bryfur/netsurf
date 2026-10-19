@@ -1288,6 +1288,7 @@ static void html_reformat(struct content *c, int width, int height)
 	/* calculate next reflow time at three times what it took to reflow */
 	nsu_getmonotonic_ms(&ms_after);
 
+	htmlc->layout_ms = (unsigned int)(ms_after - ms_before);
 	ms_interval = (ms_after - ms_before) * 3;
 	if (ms_interval < (nsoption_uint(min_reflow_period) * 10)) {
 		ms_interval = nsoption_uint(min_reflow_period) * 10;
@@ -1408,6 +1409,7 @@ static void html_destroy(struct content *c)
 		}
 	}
 	guit->misc->schedule(-1, html_rebuild_cb, html);
+	html_object_reformat_cancel(html);
 	if (html->rebuild_old_bctx != NULL) {
 		/* a rebuild under way: the layout is the old tree, the new
 		 * one's boxes are in bctx (freed with the layout below)

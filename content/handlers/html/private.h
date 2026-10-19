@@ -124,6 +124,14 @@ typedef struct html_content {
 	/** Whether an initial layout has been done */
 	bool had_initial_layout;
 
+	/** Whether a reformat for objects that became ready is scheduled
+	 * (html_object_reformat_cb: coalesced, not one per object) */
+	bool object_reformat_pending;
+
+	/** How long the last layout took (ms): a cheap one is done again at
+	 * once for an object that became ready */
+	unsigned int layout_ms;
+
 	/** Whether scripts are enabled for this content */
 	bool enable_scripting;
 

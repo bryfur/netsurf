@@ -83,4 +83,18 @@ nserror html_object_open_objects(struct html_content *html, struct browser_windo
  */
 nserror html_object_abort_objects(struct html_content *html);
 
+/**
+ * Cancel a reformat scheduled for objects that became ready (the content
+ * is being destroyed, or reformatted anyway).
+ *
+ * \param c  The HTML content
+ */
+void html_object_reformat_cancel(struct html_content *c);
+
+/**
+ * How many reformats for objects are scheduled (all contents): a page with
+ * one is not finished (--render waits for it).
+ */
+int html_object_reformats_pending(void);
+
 #endif
