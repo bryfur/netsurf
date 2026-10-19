@@ -8,6 +8,11 @@
  *         http://www.opensource.org/licenses/mit-license
  */
 
+prologue HTMLInputElement()
+%{
+#include "utils/corestrings.h"
+%}
+
 init HTMLInputElement(struct dom_html_element *html_input_element::html_element);
 
 getter HTMLInputElement::accept();
@@ -62,3 +67,18 @@ getter HTMLInputElement::size();
 setter HTMLInputElement::size();
 
 getter HTMLInputElement::type();
+
+setter HTMLInputElement::type()
+%{
+	/* libdom has no setter: the content attribute */
+	dom_string *str;
+	dom_exception exc;
+
+	if (qjsky_dom_string(ctx, val, &str) != DOM_NO_ERR) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_element_set_attribute(((node_private_t *)priv)->node,
+					corestring_dom_type, str);
+	dom_string_unref(str);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+%}

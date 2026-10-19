@@ -57,6 +57,7 @@
 #include "quickjs/polyfill.js.inc"
 #include "quickjs/selectors.js.inc"
 #include "quickjs/net.js.inc"
+#include "quickjs/domexception.js.inc"
 
 #include "qjsky.h"
 
@@ -70,6 +71,10 @@
 #ifndef NETSURF_JS_STACK
 #define NETSURF_JS_STACK (48 * 1024)
 #endif
+
+/* the modules made on demand (below) */
+enum { MODULE_SELECTORS, MODULE_NET, MODULE_DOMEXCEPTION, MODULE_COUNT };
+static JSValue module_exports(JSContext *ctx, int m);
 
 /* pointer -> object, one per page for nodes and for events (open
  * addressing, linear probing)
@@ -110,7 +115,7 @@ struct jsthread {
 	struct qjsky_map events;
 	struct js_fetch *fetches; /* the page's script fetches under way */
 	JSValue rejections; /* promises rejected without a handler (an array) */
-	JSValue modules[2]; /* the on-demand modules' exports (JS_UNDEFINED until used) */
+	JSValue modules[MODULE_COUNT]; /* the on-demand modules' exports (JS_UNDEFINED until used) */
 	int next_fetch_id;
 	JSValue classes[2 * QJSKY_CLASS_COUNT];
 };
@@ -381,7 +386,7 @@ JSValue qjsky_throw_dom(JSContext *ctx, dom_exception exc)
 		[DOM_TYPE_MISMATCH_ERR] = "TypeMismatchError",
 	};
 	const char *name = NULL;
-	JSValue err;
+	JSValue err, exports;
 
 	if (exc == DOM_NO_MEM_ERR) {
 		return JS_ThrowOutOfMemory(ctx);
@@ -392,6 +397,24 @@ JSValue qjsky_throw_dom(JSContext *ctx, dom_exception exc)
 	if (name == NULL) {
 		return JS_ThrowInternalError(ctx, "DOM error %d", (int)exc);
 	}
+
+	/* a DOMException (its module made if need be) */
+	exports = module_exports(ctx, MODULE_DOMEXCEPTION);
+	if (!JS_IsException(exports)) {
+		JSValue ctor = JS_GetPropertyStr(ctx, exports, "DOMException");
+		JSValue args[2] = { JS_NewString(ctx, name), JS_NewString(ctx, name) };
+		err = JS_CallConstructor(ctx, ctor, 2, (JSValueConst *)args);
+		JS_FreeValue(ctx, args[0]);
+		JS_FreeValue(ctx, args[1]);
+		JS_FreeValue(ctx, ctor);
+		JS_FreeValue(ctx, exports);
+		if (!JS_IsException(err)) {
+			return JS_Throw(ctx, err);
+		}
+	}
+	JS_FreeValue(ctx, JS_GetException(ctx));
+
+	/* else an Error so named */
 	err = JS_NewError(ctx);
 	if (JS_IsException(err)) {
 		return err;
@@ -1764,8 +1787,6 @@ static const JSCFunctionListEntry js_natives[] = {
  * of its exports (a lazy property of the global or a prototype)
  ***/
 
-enum { MODULE_SELECTORS, MODULE_NET, MODULE_COUNT };
-
 static const struct {
 	const char *name;
 	const unsigned char *src;
@@ -1774,6 +1795,7 @@ static const struct {
 } modules[MODULE_COUNT] = {
 	[MODULE_SELECTORS] = { "selectors.js", selectors_js, &selectors_js_len, false },
 	[MODULE_NET] = { "net.js", net_js, &net_js_len, true },
+	[MODULE_DOMEXCEPTION] = { "domexception.js", domexception_js, &domexception_js_len, false },
 };
 
 /* a module's exports (made the first time: its source evaluated, the
@@ -1836,8 +1858,10 @@ static JSValue module_export(JSContext *ctx, const JSCFunctionListEntry *e)
 #define METHOD_ATTRS (JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE)
 #define NET(n) JS_LAZY_DEF(n, module_export, (void *)(intptr_t)MODULE_NET, MODULE_ATTRS)
 #define SEL(n) JS_LAZY_DEF(n, module_export, (void *)(intptr_t)MODULE_SELECTORS, METHOD_ATTRS)
+#define DEX(n) JS_LAZY_DEF(n, module_export, (void *)(intptr_t)MODULE_DOMEXCEPTION, MODULE_ATTRS)
 
 static const JSCFunctionListEntry net_globals[] = {
+	DEX("DOMException"),
 	NET("XMLHttpRequest"), NET("fetch"), NET("Headers"), NET("Request"),
 	NET("Response"), NET("AbortController"), NET("AbortSignal"),
 	NET("TextEncoder"), NET("TextDecoder"), NET("URLSearchParams"),

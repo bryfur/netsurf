@@ -24,5 +24,19 @@ setter HTMLOptionElement::selected();
 
 getter HTMLOptionElement::text();
 
+setter HTMLOptionElement::text()
+%{
+	/* the option's text content */
+	dom_string *str;
+	dom_exception exc;
+
+	if (qjsky_dom_string(ctx, val, &str) != DOM_NO_ERR) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_node_set_text_content(((node_private_t *)priv)->node, str);
+	dom_string_unref(str);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+%}
+
 getter HTMLOptionElement::value();
 setter HTMLOptionElement::value();

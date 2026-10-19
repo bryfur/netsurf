@@ -16,6 +16,7 @@ class Location {
 prologue Location()
 %{
 #include "netsurf/browser_window.h"
+#include "netsurf/content.h"
 
 /* some of the URL, with the punctuation the URL standard gives a lone
  * part ("file:", "?q", "#f"); "" when it has none of it
@@ -60,13 +61,18 @@ static JSValue location_part(JSContext *ctx, nsurl *url, nsurl_component parts)
 }
 
 /* the browser window goes to a URL relative to the location's */
-static JSValue location_navigate(JSContext *ctx, nsurl *base, JSValueConst val,
-				 enum browser_window_nav_flags flags)
+/* the window navigated to url.  The page's own URL with a fragment is a
+ * navigation within the document (the HTML standard's): the Location takes
+ * it, and NetSurf scrolls to it if the page is the window's content already
+ * (while it loads, its scripts running, the window's content is the
+ * previous page: NetSurf would fetch this one again)
+ */
+static JSValue location_go(JSContext *ctx, location_private_t *loc, nsurl *url,
+			   enum browser_window_nav_flags flags)
 {
 	window_private_t *priv_win = qjsky_global_private(ctx);
-	nsurl *joined;
-	const char *url;
-	nserror err;
+	struct hlcache_handle *content;
+	bool current;
 
 	if (priv_win == NULL) {
 		return JS_EXCEPTION;
@@ -75,19 +81,170 @@ static JSValue location_navigate(JSContext *ctx, nsurl *base, JSValueConst val,
 		NSLOG(netsurf, INFO, "failed to get browser context");
 		return JS_UNDEFINED;
 	}
+	if (nsurl_has_component(url, NSURL_FRAGMENT) &&
+	    nsurl_compare(url, loc->url, NSURL_COMPLETE)) {
+		content = browser_window_get_content(priv_win->win);
+		current = content != NULL && hlcache_handle_get_url(content) != NULL &&
+			nsurl_compare(hlcache_handle_get_url(content), loc->url,
+				      NSURL_COMPLETE);
+		nsurl_unref(loc->url);
+		loc->url = nsurl_ref(url);
+		if (!current) {
+			return JS_UNDEFINED;
+		}
+	}
+	browser_window_navigate(priv_win->win, url, NULL, flags,
+				NULL, NULL, NULL);
+	return JS_UNDEFINED;
+}
+
+static JSValue location_navigate(JSContext *ctx, location_private_t *loc,
+				 JSValueConst val, enum browser_window_nav_flags flags)
+{
+	nsurl *joined;
+	const char *url;
+	nserror err;
+	JSValue ret;
+
 	url = JS_ToCString(ctx, val);
 	if (url == NULL) {
 		return JS_EXCEPTION;
 	}
-	err = nsurl_join(base, url, &joined);
+	err = nsurl_join(loc->url, url, &joined);
 	JS_FreeCString(ctx, url);
 	if (err != NSERROR_OK) {
 		return JS_ThrowSyntaxError(ctx, "Location: not a URL");
 	}
-	browser_window_navigate(priv_win->win, joined, NULL, flags,
-				NULL, NULL, NULL);
+	ret = location_go(ctx, loc, joined, flags);
 	nsurl_unref(joined);
-	return JS_UNDEFINED;
+	return ret;
+}
+
+/* the URL's parts, one of them replaced, made into a URL again */
+enum location_part_e {
+	LP_SCHEME, LP_USERNAME, LP_PASSWORD, LP_HOST, LP_PORT, LP_PATH,
+	LP_QUERY, LP_FRAGMENT, LP_COUNT
+};
+
+static JSValue location_set_part(JSContext *ctx, location_private_t *loc,
+				 enum location_part_e which, JSValueConst val,
+				 bool with_port)
+{
+	nsurl *url = loc->url;
+	static const nsurl_component comps[LP_COUNT] = {
+		NSURL_SCHEME, NSURL_USERNAME, NSURL_PASSWORD, NSURL_HOST,
+		NSURL_PORT, NSURL_PATH, NSURL_QUERY, NSURL_FRAGMENT
+	};
+	char *part[LP_COUNT] = { NULL };
+	const char *v, *s;
+	size_t len = 16, n;
+	char *buf, *colon;
+	nsurl *joined = NULL;
+	JSValue ret = JS_UNDEFINED;
+	int i;
+
+	v = JS_ToCString(ctx, val);
+	if (v == NULL) {
+		return JS_EXCEPTION;
+	}
+	/* the fragment and the query: nsurl's own */
+	if (which == LP_FRAGMENT || which == LP_QUERY) {
+		nserror err;
+		s = v;
+		if (*s == (which == LP_FRAGMENT ? '#' : '?')) {
+			s++;
+		}
+		if (which == LP_FRAGMENT) {
+			lwc_string *frag;
+			err = NSERROR_NOMEM;
+			if (lwc_intern_string(s, strlen(s), &frag) == lwc_error_ok) {
+				err = nsurl_refragment(url, frag, &joined);
+				lwc_string_unref(frag);
+			}
+		} else {
+			/* the query without its '?'; "" removes it */
+			err = nsurl_replace_query(url, s, &joined);
+		}
+		JS_FreeCString(ctx, v);
+		if (err != NSERROR_OK) {
+			return JS_ThrowSyntaxError(ctx, "Location: not a URL");
+		}
+		ret = location_go(ctx, loc, joined, BW_NAVIGATE_HISTORY);
+		nsurl_unref(joined);
+		return ret;
+	}
+	for (i = 0; i < LP_COUNT; i++) {
+		size_t l = 0;
+		if (i == (int)which) {
+			s = v;
+			if ((i == LP_QUERY && *s == '?') || (i == LP_FRAGMENT && *s == '#')) {
+				s++;
+			}
+			part[i] = strdup(s);
+		} else if (nsurl_get(url, comps[i], &part[i], &l) != NSERROR_OK) {
+			part[i] = NULL;
+		}
+		if (part[i] != NULL) {
+			n = strlen(part[i]);
+			/* the punctuation nsurl may give with a part */
+			if (i == LP_SCHEME && n > 0 && part[i][n - 1] == ':') {
+				part[i][n - 1] = 0;
+			} else if (i == LP_QUERY && part[i][0] == '?') {
+				memmove(part[i], part[i] + 1, n);
+			} else if (i == LP_FRAGMENT && part[i][0] == '#') {
+				memmove(part[i], part[i] + 1, n);
+			} else if (i == LP_PORT && part[i][0] == ':') {
+				memmove(part[i], part[i] + 1, n);
+			}
+			len += strlen(part[i]) + 4;
+		}
+	}
+	JS_FreeCString(ctx, v);
+	/* host="name:port" sets both */
+	if (which == LP_HOST && with_port && part[LP_HOST] != NULL &&
+	    (colon = strchr(part[LP_HOST], ':')) != NULL) {
+		*colon = 0;
+		free(part[LP_PORT]);
+		part[LP_PORT] = strdup(colon + 1);
+	}
+	buf = malloc(len);
+	if (buf == NULL) {
+		ret = JS_ThrowOutOfMemory(ctx);
+		goto out;
+	}
+#define P(k) (part[k] != NULL ? part[k] : "")
+#define HAS(k) (part[k] != NULL && part[k][0] != 0)
+	n = snprintf(buf, len, "%s:", P(LP_SCHEME));
+	if (HAS(LP_HOST) || strcasecmp(P(LP_SCHEME), "file") == 0) {
+		n += snprintf(buf + n, len - n, "//");
+		if (HAS(LP_USERNAME)) {
+			n += snprintf(buf + n, len - n, "%s%s%s@", P(LP_USERNAME),
+				      HAS(LP_PASSWORD) ? ":" : "", P(LP_PASSWORD));
+		}
+		n += snprintf(buf + n, len - n, "%s%s%s", P(LP_HOST),
+			      HAS(LP_PORT) ? ":" : "", P(LP_PORT));
+	}
+	n += snprintf(buf + n, len - n, "%s", P(LP_PATH));
+	if (HAS(LP_QUERY)) {
+		n += snprintf(buf + n, len - n, "?%s", P(LP_QUERY));
+	}
+	if (part[LP_FRAGMENT] != NULL && (which == LP_FRAGMENT || HAS(LP_FRAGMENT))) {
+		snprintf(buf + n, len - n, "#%s", P(LP_FRAGMENT));
+	}
+#undef P
+#undef HAS
+	if (nsurl_create(buf, &joined) != NSERROR_OK) {
+		ret = JS_ThrowSyntaxError(ctx, "Location: not a URL");
+	} else {
+		ret = location_go(ctx, loc, joined, BW_NAVIGATE_HISTORY);
+		nsurl_unref(joined);
+	}
+	free(buf);
+out:
+	for (i = 0; i < LP_COUNT; i++) {
+		free(part[i]);
+	}
+	return ret;
 }
 
 static JSValue location_to_string(JSContext *ctx, JSValueConst this_val,
@@ -98,7 +255,7 @@ static JSValue location_to_string(JSContext *ctx, JSValueConst this_val,
 	if (priv == NULL) {
 		return JS_EXCEPTION;
 	}
-	return location_part(ctx, priv->url, NSURL_COMPLETE);
+	return location_part(ctx, priv->url, NSURL_WITH_FRAGMENT);
 }
 
 %}
@@ -142,22 +299,22 @@ method Location::reload()
 
 method Location::assign()
 %{
-	return location_navigate(ctx, priv->url, argv[0], BW_NAVIGATE_HISTORY);
+	return location_navigate(ctx, priv, argv[0], BW_NAVIGATE_HISTORY);
 %}
 
 method Location::replace()
 %{
-	return location_navigate(ctx, priv->url, argv[0], BW_NAVIGATE_NONE);
+	return location_navigate(ctx, priv, argv[0], BW_NAVIGATE_NONE);
 %}
 
 getter Location::href()
 %{
-	return location_part(ctx, priv->url, NSURL_COMPLETE);
+	return location_part(ctx, priv->url, NSURL_WITH_FRAGMENT);
 %}
 
 setter Location::href()
 %{
-	return location_navigate(ctx, priv->url, val, BW_NAVIGATE_HISTORY);
+	return location_navigate(ctx, priv, val, BW_NAVIGATE_HISTORY);
 %}
 
 getter Location::origin()
@@ -208,4 +365,49 @@ getter Location::search()
 getter Location::hash()
 %{
 	return location_part_punct(ctx, priv->url, NSURL_FRAGMENT, "#", "");
+%}
+
+setter Location::protocol()
+%{
+	return location_set_part(ctx, priv, LP_SCHEME, val, false);
+%}
+
+setter Location::username()
+%{
+	return location_set_part(ctx, priv, LP_USERNAME, val, false);
+%}
+
+setter Location::password()
+%{
+	return location_set_part(ctx, priv, LP_PASSWORD, val, false);
+%}
+
+setter Location::host()
+%{
+	return location_set_part(ctx, priv, LP_HOST, val, true);
+%}
+
+setter Location::hostname()
+%{
+	return location_set_part(ctx, priv, LP_HOST, val, false);
+%}
+
+setter Location::port()
+%{
+	return location_set_part(ctx, priv, LP_PORT, val, false);
+%}
+
+setter Location::pathname()
+%{
+	return location_set_part(ctx, priv, LP_PATH, val, false);
+%}
+
+setter Location::search()
+%{
+	return location_set_part(ctx, priv, LP_QUERY, val, false);
+%}
+
+setter Location::hash()
+%{
+	return location_set_part(ctx, priv, LP_FRAGMENT, val, false);
 %}

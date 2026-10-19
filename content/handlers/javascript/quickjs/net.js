@@ -18,9 +18,7 @@
 	exports[name] = value;
     }
     function domError(name, message) {
-	var e = new Error(message || name);
-	e.name = name;
-	return e;
+	return new DOMException(message || name, name);
     }
 
     var STATUS = {

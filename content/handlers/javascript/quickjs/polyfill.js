@@ -202,7 +202,7 @@ DOMSettableTokenList.prototype.toString = DOMTokenList.prototype.toString;
 	case "afterbegin": this.insertBefore(frag, this.firstChild); break;
 	case "beforeend": this.appendChild(frag); break;
 	case "afterend": this.parentNode.insertBefore(frag, this.nextSibling); break;
-	default: throw new SyntaxError("insertAdjacentHTML: " + where);
+	default: throw new DOMException("insertAdjacentHTML: " + where, "SyntaxError");
 	}
     });
 

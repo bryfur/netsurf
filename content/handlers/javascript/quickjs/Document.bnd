@@ -219,6 +219,42 @@ getter Document::body()
 	return document_first_by_tag(ctx, priv->parent.node, corestring_dom_BODY);
 %}
 
+setter Document::body()
+%{
+	/* the body replaced (or added to the root element) by a body element */
+	dom_node *node = qjsky_value_node(val), *root = NULL, *res = NULL;
+	JSValue old;
+	dom_node *old_node;
+	dom_exception exc;
+
+	if (node == NULL) {
+		return JS_ThrowTypeError(ctx, "body: not an element");
+	}
+	exc = dom_document_get_document_element(priv->parent.node, (void *)&root);
+	if (exc != DOM_NO_ERR || root == NULL) {
+		return qjsky_throw_dom(ctx, exc != DOM_NO_ERR ? exc : DOM_HIERARCHY_REQUEST_ERR);
+	}
+	old = document_first_by_tag(ctx, priv->parent.node, corestring_dom_BODY);
+	if (JS_IsException(old)) {
+		dom_node_unref(root);
+		return old;
+	}
+	old_node = qjsky_value_node(old);
+	if (old_node == node) {
+		exc = DOM_NO_ERR;
+	} else if (old_node != NULL) {
+		exc = dom_node_replace_child(root, node, old_node, &res);
+	} else {
+		exc = dom_node_append_child(root, node, &res);
+	}
+	if (res != NULL) {
+		dom_node_unref(res);
+	}
+	JS_FreeValue(ctx, old);
+	dom_node_unref(root);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+%}
+
 getter Document::location()
 %{
 	JSValue global = JS_GetGlobalObject(ctx);
