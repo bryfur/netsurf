@@ -26,6 +26,7 @@
  */
 
 #include <ctype.h>
+#include <malloc.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -101,6 +102,8 @@ struct qjsky_map {
  */
 struct jsheap {
 	JSRuntime *rt; /* made when a page first needs it */
+	size_t live_bytes; /* what the runtime has allocated, in blocks */
+	size_t live_blocks;
 	bool pending_destroy;
 	unsigned int live_threads;
 	uint64_t exec_start_time;
@@ -2191,6 +2194,79 @@ nserror js_newheap(int timeout, jsheap **heap)
 	return NSERROR_OK;
 }
 
+/* the runtime's allocator: the C library's, counted, so that what a
+ * runtime leaves when it is freed (QuickJS frees what it can reach) is
+ * known
+ */
+static void *heap_malloc(void *opaque, size_t size)
+{
+	jsheap *heap = opaque;
+	void *p = malloc(size);
+
+	if (p != NULL) {
+		heap->live_bytes += malloc_usable_size(p);
+		heap->live_blocks++;
+	}
+	return p;
+}
+
+static void *heap_calloc(void *opaque, size_t count, size_t size)
+{
+	jsheap *heap = opaque;
+	void *p = calloc(count, size);
+
+	if (p != NULL) {
+		heap->live_bytes += malloc_usable_size(p);
+		heap->live_blocks++;
+	}
+	return p;
+}
+
+static void heap_free(void *opaque, void *ptr)
+{
+	jsheap *heap = opaque;
+
+	if (ptr != NULL) {
+		heap->live_bytes -= malloc_usable_size(ptr);
+		heap->live_blocks--;
+		free(ptr);
+	}
+}
+
+static void *heap_realloc(void *opaque, void *ptr, size_t size)
+{
+	jsheap *heap = opaque;
+	size_t old = ptr != NULL ? malloc_usable_size(ptr) : 0;
+	void *p;
+
+	if (size == 0) {
+		heap_free(opaque, ptr);
+		return NULL;
+	}
+	p = realloc(ptr, size);
+	if (p == NULL) {
+		return NULL;
+	}
+	if (ptr == NULL) {
+		heap->live_blocks++;
+	}
+	heap->live_bytes += malloc_usable_size(p) - old;
+	return p;
+}
+
+static size_t heap_usable_size(const void *ptr)
+{
+	return malloc_usable_size((void *)ptr);
+}
+
+static const JSMallocFunctions heap_malloc_functions = {
+	.js_calloc = heap_calloc,
+	.js_malloc = heap_malloc,
+	.js_free = heap_free,
+	.js_realloc = heap_realloc,
+	.js_malloc_usable_size = heap_usable_size,
+};
+
 /* the heap's runtime, made the first time a page needs one: NULL without
  * memory
  */
@@ -2199,7 +2275,8 @@ static JSRuntime *heap_runtime(jsheap *heap)
 	if (heap->rt != NULL) {
 		return heap->rt;
 	}
-	heap->rt = JS_NewRuntime();
+	heap->live_bytes = heap->live_blocks = 0;
+	heap->rt = JS_NewRuntime2(&heap_malloc_functions, heap);
 	if (heap->rt == NULL) {
 		return NULL;
 	}
@@ -2228,6 +2305,14 @@ static void destroyheap(jsheap *heap)
 			}
 		}
 		JS_FreeRuntime(heap->rt);
+		if (heap->live_blocks != 0) {
+			NSLOG(netsurf, WARNING, "JavaScript runtime left %zu bytes in %zu blocks",
+			      heap->live_bytes, heap->live_blocks);
+		}
+		if (getenv("NETSURF_JS_MEM") != NULL) {
+			printf("jsmem: the runtime freed, %zu bytes left in %zu blocks\n",
+			       heap->live_bytes, heap->live_blocks);
+		}
 	}
 	free(heap);
 }
