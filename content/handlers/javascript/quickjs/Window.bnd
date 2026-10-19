@@ -80,12 +80,8 @@ static void window_run_callback(window_schedule_t *sched)
 			qjsky_log_exception(ctx, "timer");
 			return;
 		}
-		qjsky_reset_timeout(ctx);
-		ret = JS_Eval(ctx, src, len, "timer", JS_EVAL_TYPE_GLOBAL);
+		ret = qjsky_eval(ctx, src, len, "timer");
 		JS_FreeCString(ctx, src);
-		if (JS_IsException(ret)) {
-			qjsky_log_exception(ctx, "timer");
-		}
 	}
 	JS_FreeValue(ctx, ret);
 }

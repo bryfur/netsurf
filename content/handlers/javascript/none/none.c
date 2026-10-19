@@ -71,6 +71,11 @@ bool js_fire_event(jsthread *thread, const char *type, struct dom_document *doc,
 	return true;
 }
 
+bool js_is_running(jsthread *thread)
+{
+	return false;
+}
+
 void js_handle_new_element(jsthread *thread, struct dom_element *node)
 {
 }

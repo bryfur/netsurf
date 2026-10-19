@@ -1399,9 +1399,17 @@ mouse_action_drag_none(html_content *html,
 		content_broadcast(c, CONTENT_MSG_POINTER, &msg_data);
 	}
 
-	/* fire dom click event */
+	/* fire dom click event: a script cancelling it (preventDefault)
+	 * stops what the click would do (follow a link, submit a form)
+	 */
 	if (mouse & BROWSER_MOUSE_CLICK_1) {
-		fire_generic_dom_event(corestring_dom_click, mas.node, true, true);
+		if (!fire_generic_dom_event(corestring_dom_click, mas.node,
+					    true, true) &&
+		    (mas.result.action == ACTION_SUBMIT ||
+		     mas.result.action == ACTION_NAVIGATE ||
+		     mas.result.action == ACTION_JS)) {
+			mas.result.action = ACTION_NONE;
+		}
 	}
 
 	/* deferred actions that can cause this browser_window to be destroyed

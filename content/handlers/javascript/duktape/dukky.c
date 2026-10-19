@@ -837,6 +837,12 @@ static void dukky_leave_thread(jsthread *thread)
 	}
 }
 
+/* exported interface documented in js.h */
+bool js_is_running(jsthread *thread)
+{
+	return thread != NULL && thread->in_use > 0;
+}
+
 duk_bool_t dukky_check_timeout(void *udata)
 {
 #define JS_EXEC_TIMEOUT_MS 10000 /* 10 seconds */

@@ -129,6 +129,12 @@ void js_destroythread(jsthread *thread);
 bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *name);
 
 /**
+ * Whether the thread is running script (a script, an event handler, a
+ * timer): what changes the DOM then is the page's doing
+ */
+bool js_is_running(jsthread *thread);
+
+/**
  * fire an event at a dom node
  */
 bool js_fire_event(jsthread *thread, const char *type, struct dom_document *doc, struct dom_node *target);

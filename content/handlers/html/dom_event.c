@@ -709,6 +709,8 @@ dom_default_action_DOMSubtreeModified_cb(struct dom_event *evt, void *pw)
 	dom_exception exc;
 	html_content *htmlc = pw;
 
+	html_dom_mutated(htmlc);
+
 	exc = dom_event_get_target(evt, &node);
 	if ((exc == DOM_NO_ERR) && (node != NULL)) {
 		if (htmlc->title == (dom_node *)node) {

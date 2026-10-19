@@ -415,6 +415,169 @@ void html_finish_conversion(html_content *htmlc)
 }
 
 
+/*
+ * The box tree made again when a script changes the DOM after the layout:
+ * the conversion into a new talloc context while the old layout is still
+ * drawn, then the swap, the old boxes and objects freed, a reformat.  A
+ * frameset or iframes stay as they were (their browser windows follow the
+ * first box tree).
+ */
+
+static void html_rebuild_cb(void *p);
+
+static void html_rebuild_schedule(html_content *htmlc, int ms)
+{
+	if (!htmlc->rebuild_scheduled) {
+		htmlc->rebuild_scheduled = true;
+		guit->misc->schedule(ms, html_rebuild_cb, htmlc);
+	}
+}
+
+/* exported function documented in html/private.h */
+void html_dom_mutated(html_content *htmlc)
+{
+	if (!htmlc->had_initial_layout || htmlc->jsthread == NULL ||
+	    !js_is_running(htmlc->jsthread)) {
+		return;
+	}
+	htmlc->dom_dirty = true;
+	html_rebuild_schedule(htmlc, 10);
+}
+
+/* the nodes whose box (user data) is in a box tree being freed: unset */
+static void html_rebuild_clear_nodes(struct box *box)
+{
+	for (; box != NULL; box = box->next) {
+		if (box->node != NULL) {
+			struct box *b = NULL;
+			if (dom_node_get_user_data(box->node,
+					corestring_dom___ns_key_box_node_data,
+					(void *)&b) == DOM_NO_ERR && b == box) {
+				dom_node_set_user_data(box->node,
+					corestring_dom___ns_key_box_node_data,
+					NULL, NULL, (void *)&b);
+			}
+		}
+		html_rebuild_clear_nodes(box->children);
+	}
+}
+
+/* the old box tree, its objects and context gone (layout is the old tree) */
+static void html_rebuild_free_old(html_content *htmlc, struct box *layout)
+{
+	struct content_html_object *objects = htmlc->object_list;
+
+	html_rebuild_clear_nodes(layout);
+	htmlc->object_list = htmlc->rebuild_old_objects;
+	html_object_free_objects(htmlc);
+	htmlc->object_list = objects;
+	htmlc->rebuild_old_objects = NULL;
+	if (htmlc->rebuild_old_bctx != NULL) {
+		talloc_free(htmlc->rebuild_old_bctx);
+		htmlc->rebuild_old_bctx = NULL;
+	}
+}
+
+static void html_rebuild_done(html_content *c, bool success)
+{
+	struct box *old_layout = c->rebuild_old_layout;
+
+	c->box_conversion_context = NULL;
+	c->rebuild_old_layout = NULL;
+
+	if (!success || c->layout == old_layout) {
+		/* the new tree (if any) is lost: the old one stays */
+		NSLOG(netsurf, ERROR, "Box tree rebuild failed (content %p)", c);
+		return;
+	}
+
+	/* what pointed into the old tree */
+	if (c->focus_type == HTML_FOCUS_TEXTAREA) {
+		struct box *box = c->focus_owner.textarea;
+		if (box != NULL && box->gadget != NULL && box->gadget->box != NULL) {
+			c->focus_owner.textarea = box->gadget->box;
+		} else {
+			c->focus_type = HTML_FOCUS_SELF;
+			c->focus_owner.self = true;
+		}
+	}
+	c->selection_type = HTML_SELECTION_NONE;
+	c->selection_owner.none = true;
+	c->drag_type = HTML_DRAG_NONE;
+	c->drag_owner.no_owner = true;
+	selection_clear(c->sel, false);
+	imagemap_destroy(c);
+	imagemap_extract(c);
+
+	html_rebuild_free_old(c, old_layout);
+
+	NSLOG(netsurf, INFO, "Box tree rebuilt (content %p)", c);
+	if ((content__get_status(&c->base) == CONTENT_STATUS_READY ||
+	     content__get_status(&c->base) == CONTENT_STATUS_DONE) &&
+	    c->base.available_width > 0) {
+		content__reformat(&c->base, false, c->base.available_width,
+				  c->base.available_height);
+	}
+	if (c->dom_dirty) {
+		html_rebuild_schedule(c, 10);
+	}
+}
+
+static void html_rebuild_cb(void *p)
+{
+	html_content *htmlc = p;
+	content_status status = content__get_status(&htmlc->base);
+	dom_node *html;
+	nserror err;
+
+	htmlc->rebuild_scheduled = false;
+	if (!htmlc->dom_dirty || htmlc->aborted) {
+		return;
+	}
+	if (htmlc->box_conversion_context != NULL ||
+	    (status != CONTENT_STATUS_READY && status != CONTENT_STATUS_DONE) ||
+	    htmlc->reflowing || htmlc->base.locked) {
+		/* a conversion or reformat under way: after it */
+		html_rebuild_schedule(htmlc, 20);
+		return;
+	}
+	if (htmlc->frameset != NULL || htmlc->iframe != NULL) {
+		NSLOG(netsurf, INFO, "DOM changed: frames are not laid out again");
+		htmlc->dom_dirty = false;
+		return;
+	}
+	htmlc->dom_dirty = false;
+
+	if (dom_document_get_document_element(htmlc->document,
+					      (void *)&html) != DOM_NO_ERR ||
+	    html == NULL) {
+		return;
+	}
+
+	/* the new tree in a context of its own, with objects of its own */
+	htmlc->rebuild_old_bctx = htmlc->bctx;
+	htmlc->rebuild_old_objects = htmlc->object_list;
+	htmlc->rebuild_old_layout = htmlc->layout;
+	htmlc->bctx = NULL;
+	htmlc->object_list = NULL;
+	html_get_dimensions(htmlc);
+
+	err = dom_to_box(html, htmlc, html_rebuild_done,
+			 &htmlc->box_conversion_context);
+	dom_node_unref(html);
+	if (err != NSERROR_OK) {
+		NSLOG(netsurf, ERROR, "Box tree rebuild not started");
+		if (htmlc->bctx != NULL) {
+			talloc_free(htmlc->bctx);
+		}
+		htmlc->bctx = htmlc->rebuild_old_bctx;
+		htmlc->object_list = htmlc->rebuild_old_objects;
+		htmlc->rebuild_old_bctx = NULL;
+		htmlc->rebuild_old_objects = NULL;
+		htmlc->rebuild_old_layout = NULL;
+	}
+}
+
 static void
 html_document_user_data_handler(dom_node_operation operation,
 				dom_string *key, void *data,
@@ -1215,6 +1378,14 @@ static void html_destroy(struct content *c)
 		if (cancel_dom_to_box(html->box_conversion_context) != NSERROR_OK) {
 			NSLOG(netsurf, CRITICAL, "WARNING, Unable to cancel conversion context, browser may crash");
 		}
+	}
+	guit->misc->schedule(-1, html_rebuild_cb, html);
+	if (html->rebuild_old_bctx != NULL) {
+		/* a rebuild under way: the layout is the old tree, the new
+		 * one's boxes are in bctx (freed with the layout below)
+		 */
+		html_rebuild_free_old(html, html->rebuild_old_layout);
+		html->rebuild_old_layout = NULL;
 	}
 
 	selection_destroy(html->sel);

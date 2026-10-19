@@ -89,6 +89,7 @@ struct jsthread {
 	bool pending_destroy;
 	bool failed; /* its context could not be made */
 	unsigned int in_use;
+	unsigned int running; /* script running (js_is_running) */
 	jsheap *heap;
 	JSContext *ctx; /* made when the page first needs it (thread_context) */
 	void *win_priv; /* the browser window and content, for the Window */
@@ -691,15 +692,40 @@ static void run_jobs(JSContext *ctx)
 JSValue qjsky_call(JSContext *ctx, JSValueConst func, JSValueConst this_val,
 		   int argc, JSValueConst *argv)
 {
+	jsthread *thread = thread_of(ctx);
 	JSValue ret;
 
+	thread->running++;
 	reset_timeout(heap_of(ctx));
 	ret = JS_Call(ctx, func, this_val, argc, argv);
 	if (JS_IsException(ret)) {
 		qjsky_log_exception(ctx, "callback");
 	}
 	run_jobs(ctx);
+	thread->running--;
 	return ret;
+}
+
+JSValue qjsky_eval(JSContext *ctx, const char *src, size_t len, const char *name)
+{
+	jsthread *thread = thread_of(ctx);
+	JSValue ret;
+
+	thread->running++;
+	reset_timeout(heap_of(ctx));
+	ret = JS_Eval(ctx, src, len, name, JS_EVAL_TYPE_GLOBAL);
+	if (JS_IsException(ret)) {
+		qjsky_log_exception(ctx, name);
+	}
+	run_jobs(ctx);
+	thread->running--;
+	return ret;
+}
+
+/* exported interface documented in js.h */
+bool js_is_running(jsthread *thread)
+{
+	return thread != NULL && thread->running > 0;
 }
 
 JSValue qjsky_generic(JSContext *ctx, const char *name)
@@ -1455,6 +1481,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 	buf[txtlen] = 0;
 
 	thread->in_use++;
+	thread->running++;
 	reset_timeout(thread->heap);
 	r = JS_Eval(ctx, buf, txtlen, name != NULL ? name : "?unknown source?",
 		    JS_EVAL_TYPE_GLOBAL);
@@ -1466,6 +1493,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		JS_FreeValue(ctx, r);
 	}
 	run_jobs(ctx);
+	thread->running--;
 	thread->heap->exec_start_time = 0;
 
 	thread->in_use--;

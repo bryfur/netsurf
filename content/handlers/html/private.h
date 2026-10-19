@@ -138,6 +138,17 @@ typedef struct html_content {
 	void *box_conversion_context;
 	/** Box tree, or NULL. */
 	struct box *layout;
+
+	/** The DOM changed (by a script) since the layout was made */
+	bool dom_dirty;
+	/** A rebuild of the box tree is scheduled */
+	bool rebuild_scheduled;
+	/** While a rebuild converts: the old tree's talloc context and
+	 * objects (the old layout stays drawn until the new one is done)
+	 */
+	int *rebuild_old_bctx;
+	struct content_html_object *rebuild_old_objects;
+	struct box *rebuild_old_layout;
 	/** Document background colour. */
 	colour background_colour;
 
@@ -235,6 +246,13 @@ void html__redraw_a_box(html_content *htmlc, struct box *box);
  * \param htmlc Content to convert
  */
 void html_finish_conversion(html_content *htmlc);
+
+/**
+ * The document changed (a mutation event): if a script did it after the
+ * layout was made, the box tree is made again (scheduled, once for a run
+ * of changes)
+ */
+void html_dom_mutated(html_content *htmlc);
 
 
 /**

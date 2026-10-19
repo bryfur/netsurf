@@ -152,6 +152,13 @@ JSValue qjsky_generic(JSContext *ctx, const char *name);
 JSValue qjsky_call(JSContext *ctx, JSValueConst func, JSValueConst this_val,
 		   int argc, JSValueConst *argv);
 
+/**
+ * Source run as a global script as a timer's would be (the exception
+ * logged, the job queue run after): the result, or JS_EXCEPTION.  src is
+ * NUL terminated at src[len].
+ */
+JSValue qjsky_eval(JSContext *ctx, const char *src, size_t len, const char *name);
+
 /** The pending exception logged (and cleared) */
 void qjsky_log_exception(JSContext *ctx, const char *what);
 
