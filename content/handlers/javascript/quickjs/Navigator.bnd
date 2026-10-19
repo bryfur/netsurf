@@ -1,0 +1,102 @@
+/* Navigator binding for browser using QuickJS-ng and libdom
+ *
+ * Copyright 2015 Vincent Sanders <vince@netsurf-browser.org>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+prologue Navigator()
+%{
+#include "utils/useragent.h"
+#include "utils/nsoption.h"
+%}
+
+method Navigator::taintEnabled()
+%{
+	(void)priv;
+	return JS_FALSE;
+%}
+
+getter Navigator::appCodeName()
+%{
+	(void)priv;
+	return JS_NewString(ctx, "Mozilla");
+%}
+
+getter Navigator::appName()
+%{
+	(void)priv;
+	return JS_NewString(ctx, "Netscape");
+%}
+
+getter Navigator::appVersion()
+%{
+	(void)priv;
+	return JS_NewString(ctx, "3.4");
+%}
+
+getter Navigator::platform()
+%{
+	(void)priv;
+	return JS_NewString(ctx, "");
+%}
+
+getter Navigator::product()
+%{
+	(void)priv;
+	return JS_NewString(ctx, "Gecko");
+%}
+
+getter Navigator::productSub()
+%{
+	(void)priv;
+	return JS_NewString(ctx, "20100101");
+%}
+
+getter Navigator::vendor()
+%{
+	(void)priv;
+	return JS_NewString(ctx, "");
+%}
+
+getter Navigator::vendorSub()
+%{
+	(void)priv;
+	return JS_NewString(ctx, "");
+%}
+
+getter Navigator::cookieEnabled()
+%{
+	/* document.cookie works */
+	(void)priv;
+	return JS_TRUE;
+%}
+
+/* indicate there is no plugin for java installed */
+getter Navigator::javaEnabled()
+%{
+	(void)priv;
+	return JS_FALSE;
+%}
+
+getter Navigator::userAgent()
+%{
+	(void)priv;
+	return JS_NewString(ctx, user_agent_string());
+%}
+
+getter Navigator::language()
+%{
+	const char *lang = nsoption_charp(accept_language);
+	(void)priv;
+	return JS_NewString(ctx, (lang != NULL && lang[0] != 0) ? lang : "en");
+%}
+
+getter Navigator::onLine()
+%{
+	(void)priv;
+	return JS_TRUE;
+%}

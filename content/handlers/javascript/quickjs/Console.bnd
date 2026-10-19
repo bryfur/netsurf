@@ -1,0 +1,232 @@
+/* Console binding for browser using QuickJS-ng and libdom
+ *
+ * Copyright 2015 Vincent Sanders <vince@netsurf-browser.org>
+ * Copyright 2015 Daniel Silverstone <dsilvers@netsurf-browser.org>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+class Console {
+      private unsigned int group;
+      prologue %{
+#include <nsutils/time.h>
+#include "netsurf/browser_window.h"
+
+/* a console entry: the arguments through generics.js's formatter, joined
+ * by spaces, indented by the group depth, to the browser window's console
+ */
+static JSValue write_log_entry(JSContext *ctx, unsigned int group,
+			       browser_window_console_flags flags,
+			       int argc, JSValueConst *argv)
+{
+	window_private_t *priv_win = qjsky_global_private(ctx);
+	JSValue formatter, parts, joined, sep;
+	const char *msg;
+	size_t msglen;
+	char *line;
+	unsigned int u;
+
+	if (priv_win == NULL) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return JS_UNDEFINED;
+	}
+
+	formatter = qjsky_generic(ctx, "consoleFormatter");
+	parts = JS_Call(ctx, formatter, JS_UNDEFINED, argc, argv);
+	JS_FreeValue(ctx, formatter);
+	if (JS_IsException(parts)) {
+		return parts;
+	}
+	sep = JS_NewString(ctx, " ");
+	{
+		JSValue join = JS_GetPropertyStr(ctx, parts, "join");
+		joined = JS_Call(ctx, join, parts, 1, (JSValueConst *)&sep);
+		JS_FreeValue(ctx, join);
+	}
+	JS_FreeValue(ctx, sep);
+	JS_FreeValue(ctx, parts);
+	if (JS_IsException(joined)) {
+		return joined;
+	}
+	msg = JS_ToCStringLen(ctx, &msglen, joined);
+	JS_FreeValue(ctx, joined);
+	if (msg == NULL) {
+		return JS_EXCEPTION;
+	}
+
+	line = malloc(group + msglen + 1);
+	if (line != NULL) {
+		for (u = 0; u < group; u++) {
+			line[u] = ' ';
+		}
+		memcpy(line + group, msg, msglen);
+		line[group + msglen] = 0;
+		if (priv_win->win == NULL || priv_win->closed_down ||
+		    browser_window_console_log(priv_win->win, BW_CS_SCRIPT_CONSOLE,
+					       line, group + msglen,
+					       flags) != NSERROR_OK) {
+			NSLOG(netsurf, DEBUG, "Unable to log: %s", line);
+		}
+		free(line);
+	}
+	JS_FreeCString(ctx, msg);
+	return JS_UNDEFINED;
+}
+
+/* the label of console.time/timeEnd ("default" when none) */
+static JSValue console_label(JSContext *ctx, int argc, JSValueConst *argv)
+{
+	if (argc < 1 || JS_IsUndefined(argv[0])) {
+		return JS_NewString(ctx, "default");
+	}
+	return JS_ToString(ctx, argv[0]);
+}
+
+%};
+};
+
+init Console ()
+%{
+	priv->group = 0;
+%}
+
+method Console::group ()
+%{
+	priv->group++;
+	return JS_UNDEFINED;
+%}
+
+method Console::groupCollapsed ()
+%{
+	priv->group++;
+	return JS_UNDEFINED;
+%}
+
+method Console::groupEnd ()
+%{
+	if (priv->group) {
+		priv->group--;
+	}
+	return JS_UNDEFINED;
+%}
+
+method Console::info()
+%{
+	return write_log_entry(ctx, priv->group, BW_CS_FLAG_LEVEL_INFO, argc, argv);
+%}
+
+method Console::debug()
+%{
+	return write_log_entry(ctx, priv->group, BW_CS_FLAG_LEVEL_DEBUG, argc, argv);
+%}
+
+method Console::error()
+%{
+	return write_log_entry(ctx, priv->group, BW_CS_FLAG_LEVEL_ERROR, argc, argv);
+%}
+
+method Console::log()
+%{
+	return write_log_entry(ctx, priv->group, BW_CS_FLAG_LEVEL_LOG, argc, argv);
+%}
+
+method Console::warn()
+%{
+	return write_log_entry(ctx, priv->group, BW_CS_FLAG_LEVEL_WARN, argc, argv);
+%}
+
+method Console::dir()
+%{
+	return write_log_entry(ctx, priv->group, BW_CS_FLAG_LEVEL_INFO, argc, argv);
+%}
+
+method Console::time()
+%{
+	uint64_t time_ms = 0;
+	JSValue timers, label;
+	JSAtom atom;
+	int r;
+
+	(void)priv;
+	if (nsu_getmonotonic_ms(&time_ms) != NSUERROR_OK) {
+		return JS_UNDEFINED;
+	}
+	label = console_label(ctx, argc, argv);
+	if (JS_IsException(label)) {
+		return label;
+	}
+	timers = qjsky_hidden_object(ctx, this_val, QJSKY_HIDDEN_CONSOLE_TIMERS);
+	if (JS_IsException(timers)) {
+		JS_FreeValue(ctx, label);
+		return timers;
+	}
+	atom = JS_ValueToAtom(ctx, label);
+	r = JS_SetProperty(ctx, timers, atom, JS_NewFloat64(ctx, (double)time_ms));
+	JS_FreeAtom(ctx, atom);
+	JS_FreeValue(ctx, timers);
+	JS_FreeValue(ctx, label);
+	return r < 0 ? JS_EXCEPTION : JS_UNDEFINED;
+%}
+
+method Console::timeEnd()
+%{
+	uint64_t time_ms = 0;
+	double start;
+	JSValue timers, label, old, msg, ret;
+	JSAtom atom;
+	char buf[96];
+	const char *name;
+
+	if (nsu_getmonotonic_ms(&time_ms) != NSUERROR_OK) {
+		return JS_UNDEFINED;
+	}
+	label = console_label(ctx, argc, argv);
+	if (JS_IsException(label)) {
+		return label;
+	}
+	timers = qjsky_hidden_object(ctx, this_val, QJSKY_HIDDEN_CONSOLE_TIMERS);
+	if (JS_IsException(timers)) {
+		JS_FreeValue(ctx, label);
+		return timers;
+	}
+	atom = JS_ValueToAtom(ctx, label);
+	old = JS_GetProperty(ctx, timers, atom);
+	start = (double)time_ms;
+	if (!JS_IsUndefined(old)) {
+		JS_ToFloat64(ctx, &start, old);
+	}
+	JS_DeleteProperty(ctx, timers, atom, 0);
+	JS_FreeAtom(ctx, atom);
+	JS_FreeValue(ctx, old);
+	JS_FreeValue(ctx, timers);
+
+	name = JS_ToCString(ctx, label);
+	JS_FreeValue(ctx, label);
+	snprintf(buf, sizeof(buf), "%s: %u ms", name != NULL ? name : "",
+		 (unsigned)((double)time_ms - start));
+	JS_FreeCString(ctx, name);
+	msg = JS_NewString(ctx, buf);
+	ret = write_log_entry(ctx, priv->group, BW_CS_FLAG_LEVEL_INFO, 1,
+			      (JSValueConst *)&msg);
+	JS_FreeValue(ctx, msg);
+	return ret;
+%}
+
+method Console::trace ()
+%{
+	JSValue err = JS_NewError(ctx);
+	JSValue stack, ret;
+
+	if (JS_IsException(err)) {
+		return err;
+	}
+	stack = JS_GetPropertyStr(ctx, err, "stack");
+	JS_FreeValue(ctx, err);
+	ret = write_log_entry(ctx, priv->group, BW_CS_FLAG_LEVEL_INFO, 1,
+			      (JSValueConst *)&stack);
+	JS_FreeValue(ctx, stack);
+	return ret;
+%}

@@ -1,0 +1,97 @@
+/* Binding for browser using QuickJS-ng and libdom
+ *
+ * Copyright 2019 Michael Drake <tlsa@netsurf-browser.org>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+prologue KeyboardEvent()
+%{
+typedef dom_exception (*keyboard_flag_t)(dom_keyboard_event *evt, bool *flag);
+
+/* (libdom's getters are macros) */
+static dom_exception kbd_ctrl(dom_keyboard_event *e, bool *f) { return dom_keyboard_event_get_ctrl_key(e, f); }
+static dom_exception kbd_shift(dom_keyboard_event *e, bool *f) { return dom_keyboard_event_get_shift_key(e, f); }
+static dom_exception kbd_alt(dom_keyboard_event *e, bool *f) { return dom_keyboard_event_get_alt_key(e, f); }
+static dom_exception kbd_meta(dom_keyboard_event *e, bool *f) { return dom_keyboard_event_get_meta_key(e, f); }
+
+static JSValue keyboard_flag(JSContext *ctx, dom_event *evt, keyboard_flag_t get)
+{
+	bool ret;
+	dom_exception exc = get((dom_keyboard_event *)evt, &ret);
+	if (exc != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, exc);
+	}
+	return JS_NewBool(ctx, ret);
+}
+%}
+
+init KeyboardEvent (struct dom_keyboard_event *evt::ui_event);
+
+getter KeyboardEvent::key ()
+%{
+	dom_string *key = NULL;
+	dom_exception err = dom_keyboard_event_get_key(
+		(dom_keyboard_event *)priv->parent.parent.evt, &key);
+	return qjsky_string_result(ctx, err, key, false);
+%}
+
+getter KeyboardEvent::code ()
+%{
+	dom_string *code = NULL;
+	dom_exception err = dom_keyboard_event_get_code(
+		(dom_keyboard_event *)priv->parent.parent.evt, &code);
+	return qjsky_string_result(ctx, err, code, false);
+%}
+
+getter KeyboardEvent::location ()
+%{
+	dom_key_location location;
+	dom_exception err = dom_keyboard_event_get_location(
+		(dom_keyboard_event *)priv->parent.parent.evt, &location);
+	if (err != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, err);
+	}
+	return JS_NewUint32(ctx, location);
+%}
+
+getter KeyboardEvent::ctrlKey ()
+%{
+	return keyboard_flag(ctx, priv->parent.parent.evt, kbd_ctrl);
+%}
+
+getter KeyboardEvent::shiftKey ()
+%{
+	return keyboard_flag(ctx, priv->parent.parent.evt, kbd_shift);
+%}
+
+getter KeyboardEvent::altKey ()
+%{
+	return keyboard_flag(ctx, priv->parent.parent.evt, kbd_alt);
+%}
+
+getter KeyboardEvent::metaKey ()
+%{
+	return keyboard_flag(ctx, priv->parent.parent.evt, kbd_meta);
+%}
+
+method KeyboardEvent::getModifierState ()
+%{
+	dom_string *modifier;
+	dom_exception err;
+	bool state;
+
+	if (qjsky_dom_string(ctx, argv[0], &modifier) != DOM_NO_ERR) {
+		return JS_EXCEPTION;
+	}
+	err = dom_keyboard_event_get_modifier_state(
+		(dom_keyboard_event *)priv->parent.parent.evt, modifier, &state);
+	dom_string_unref(modifier);
+	if (err != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, err);
+	}
+	return JS_NewBool(ctx, state);
+%}

@@ -1,0 +1,47 @@
+/* NodeList binding for browser using QuickJS-ng and libdom
+ *
+ * Copyright 2015 Vincent Sanders <vince@netsurf-browser.org>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+class NodeList {
+	private struct dom_nodelist *nodes;
+};
+
+init NodeList(struct dom_nodelist *nodes)
+%{
+	priv->nodes = nodes;
+	dom_nodelist_ref(nodes);
+%}
+
+fini NodeList()
+%{
+	dom_nodelist_unref(priv->nodes);
+%}
+
+getter NodeList::length()
+%{
+	uint32_t len;
+	dom_exception err = dom_nodelist_get_length(priv->nodes, &len);
+	if (err != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, err);
+	}
+	return JS_NewUint32(ctx, len);
+%}
+
+method NodeList::item()
+%{
+	uint32_t i;
+	dom_node *node = NULL;
+	dom_exception err;
+
+	if (JS_ToUint32(ctx, &i, argv[0]) < 0) {
+		return JS_EXCEPTION;
+	}
+	err = dom_nodelist_item(priv->nodes, i, &node);
+	return qjsky_node_result(ctx, err, node);
+%}

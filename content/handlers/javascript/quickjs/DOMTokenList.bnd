@@ -1,0 +1,157 @@
+/* DOMTokenList binding for browser using QuickJS-ng and libdom
+ *
+ * Copyright 2015 Vincent Sanders <vince@netsurf-browser.org>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+class DOMTokenList {
+	private struct dom_tokenlist *tokens;
+};
+
+prologue DOMTokenList()
+%{
+/* a token argument as an interned dom string: NULL with an exception pending */
+static dom_string *token_arg(JSContext *ctx, JSValueConst val)
+{
+	dom_string *value;
+	size_t slen;
+	const char *s = JS_ToCStringLen(ctx, &slen, val);
+	dom_exception exc;
+
+	if (s == NULL) {
+		return NULL;
+	}
+	exc = dom_string_create_interned((const uint8_t *)s, slen, &value);
+	JS_FreeCString(ctx, s);
+	if (exc != DOM_NO_ERR) {
+		qjsky_throw_dom(ctx, exc);
+		return NULL;
+	}
+	return value;
+}
+
+typedef dom_exception (*token_op_t)(struct dom_tokenlist *list, dom_string *value);
+
+/* add or remove each argument */
+static JSValue token_each(JSContext *ctx, struct dom_tokenlist *tokens,
+			  token_op_t op, int argc, JSValueConst *argv)
+{
+	int i;
+
+	for (i = 0; i < argc; i++) {
+		dom_exception exc;
+		dom_string *value = token_arg(ctx, argv[i]);
+		if (value == NULL) {
+			return JS_EXCEPTION;
+		}
+		exc = op(tokens, value);
+		dom_string_unref(value);
+		if (exc != DOM_NO_ERR) {
+			return qjsky_throw_dom(ctx, exc);
+		}
+	}
+	return JS_UNDEFINED;
+}
+%}
+
+init DOMTokenList(struct dom_tokenlist *tokens)
+%{
+	priv->tokens = tokens;
+	dom_tokenlist_ref(tokens);
+%}
+
+fini DOMTokenList()
+%{
+	dom_tokenlist_unref(priv->tokens);
+%}
+
+getter DOMTokenList::length()
+%{
+	uint32_t len;
+	dom_exception err = dom_tokenlist_get_length(priv->tokens, &len);
+	if (err != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, err);
+	}
+	return JS_NewUint32(ctx, len);
+%}
+
+method DOMTokenList::item()
+%{
+	uint32_t i;
+	dom_string *value = NULL;
+	dom_exception err;
+
+	if (JS_ToUint32(ctx, &i, argv[0]) < 0) {
+		return JS_EXCEPTION;
+	}
+	err = dom_tokenlist_item(priv->tokens, i, &value);
+	return qjsky_string_result(ctx, err, value, true);
+%}
+
+method DOMTokenList::add()
+%{
+	return token_each(ctx, priv->tokens, dom_tokenlist_add, argc, argv);
+%}
+
+method DOMTokenList::remove()
+%{
+	return token_each(ctx, priv->tokens, dom_tokenlist_remove, argc, argv);
+%}
+
+method DOMTokenList::contains()
+%{
+	dom_exception exc;
+	bool present = false;
+	dom_string *value = token_arg(ctx, argv[0]);
+
+	if (value == NULL) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_tokenlist_contains(priv->tokens, value, &present);
+	dom_string_unref(value);
+	if (exc != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, exc);
+	}
+	return JS_NewBool(ctx, present);
+%}
+
+method DOMTokenList::toggle()
+%{
+	dom_exception exc;
+	bool present;
+	bool want;
+	dom_string *value = token_arg(ctx, argv[0]);
+
+	if (value == NULL) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_tokenlist_contains(priv->tokens, value, &present);
+	if (exc != DOM_NO_ERR) {
+		dom_string_unref(value);
+		return qjsky_throw_dom(ctx, exc);
+	}
+	/* with force: force's way; without: the other way */
+	if (argc > 1 && !JS_IsUndefined(argv[1])) {
+		int force = JS_ToBool(ctx, argv[1]);
+		if (force < 0) {
+			dom_string_unref(value);
+			return JS_EXCEPTION;
+		}
+		want = force;
+	} else {
+		want = !present;
+	}
+	if (want != present) {
+		exc = want ? dom_tokenlist_add(priv->tokens, value) :
+			dom_tokenlist_remove(priv->tokens, value);
+	}
+	dom_string_unref(value);
+	if (exc != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, exc);
+	}
+	return JS_NewBool(ctx, want);
+%}

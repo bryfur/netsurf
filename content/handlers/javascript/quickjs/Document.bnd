@@ -1,0 +1,448 @@
+/* document binding for browser using QuickJS-ng and libdom
+ *
+ * Copyright 2015 Vincent Sanders <vince@netsurf-browser.org>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+prologue Document()
+%{
+#include "utils/corestrings.h"
+#include "utils/libdom.h"
+#include "utils/utils.h"
+#include "content/hlcache.h"
+#include "html/private.h"
+#include "content/urldb.h"
+
+/* a string argument as a dom string: NULL with an exception pending */
+static dom_string *document_string_arg(JSContext *ctx, JSValueConst val)
+{
+	dom_string *str;
+	if (qjsky_dom_string(ctx, val, &str) != DOM_NO_ERR) {
+		return NULL;
+	}
+	return str;
+}
+
+static struct html_content *document_htmlc(dom_node *node)
+{
+	struct html_content *htmlc = NULL;
+	dom_exception err = dom_node_get_user_data(node,
+		corestring_dom___ns_key_html_content_data, &htmlc);
+	if (err != DOM_NO_ERR || htmlc == NULL) {
+		NSLOG(netsurf, INFO, "error getting htmlc. node:%p", node);
+		return NULL;
+	}
+	return htmlc;
+}
+
+/* document.write: the arguments joined, into the parser (then a newline
+ * for writeln)
+ */
+static JSValue document_write(JSContext *ctx, dom_node *node, int argc,
+			      JSValueConst *argv, bool newline)
+{
+	struct html_content *htmlc = document_htmlc(node);
+	int i;
+
+	if (htmlc == NULL) {
+		return JS_UNDEFINED;
+	}
+	if (htmlc->parser == NULL) {
+		NSLOG(netsurf, INFO, "error; no parser for htmlc: %p", htmlc);
+		return JS_UNDEFINED;
+	}
+	for (i = 0; i < argc; i++) {
+		size_t len;
+		const char *text = JS_ToCStringLen(ctx, &len, argv[i]);
+		if (text == NULL) {
+			return JS_EXCEPTION;
+		}
+		NSLOG(netsurf, DEBUG, "Writing %*s", (int)len, text);
+		dom_hubbub_parser_insert_chunk(htmlc->parser, (const uint8_t *)text, len);
+		JS_FreeCString(ctx, text);
+	}
+	if (newline) {
+		dom_hubbub_parser_insert_chunk(htmlc->parser, (const uint8_t *)"\n", 1);
+	}
+	return JS_UNDEFINED;
+}
+
+/* the first element named tag (HEAD, BODY) */
+static JSValue document_first_by_tag(JSContext *ctx, dom_node *node, dom_string *tag)
+{
+	struct dom_nodelist *nodes = NULL;
+	struct dom_node *retnode = NULL;
+	dom_exception err;
+
+	err = dom_document_get_elements_by_tag_name(node, tag, &nodes);
+	if (err != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, err);
+	}
+	err = dom_nodelist_item(nodes, 0, &retnode);
+	dom_nodelist_unref(nodes);
+	return qjsky_node_result(ctx, err, retnode);
+}
+
+static JSValue document_make_implementation(JSContext *ctx)
+{
+	return qjsky_dom_implementation___create(ctx);
+}
+
+%}
+
+init Document(struct dom_document *document::node);
+
+method Document::write()
+%{
+	return document_write(ctx, priv->parent.node, argc, argv, false);
+%}
+
+method Document::writeln()
+%{
+	return document_write(ctx, priv->parent.node, argc, argv, true);
+%}
+
+method Document::createTextNode()
+%{
+	dom_node *newnode = NULL;
+	dom_exception err;
+	dom_string *text = document_string_arg(ctx, argv[0]);
+
+	if (text == NULL) {
+		return JS_EXCEPTION;
+	}
+	err = dom_document_create_text_node(priv->parent.node, text, &newnode);
+	dom_string_unref(text);
+	return qjsky_node_result(ctx, err, newnode);
+%}
+
+method Document::createElement()
+%{
+	dom_node *newnode = NULL;
+	dom_exception err;
+	dom_string *name = document_string_arg(ctx, argv[0]);
+
+	if (name == NULL) {
+		return JS_EXCEPTION;
+	}
+	err = dom_document_create_element_ns(priv->parent.node,
+					     corestring_dom_html_namespace,
+					     name, &newnode);
+	dom_string_unref(name);
+	return qjsky_node_result(ctx, err, newnode);
+%}
+
+method Document::createElementNS()
+%{
+	dom_node *newnode = NULL;
+	dom_exception err;
+	dom_string *ns = NULL, *name;
+
+	if (!JS_IsNull(argv[0])) {
+		ns = document_string_arg(ctx, argv[0]);
+		if (ns == NULL) {
+			return JS_EXCEPTION;
+		}
+	}
+	name = document_string_arg(ctx, argv[1]);
+	if (name == NULL) {
+		if (ns != NULL) {
+			dom_string_unref(ns);
+		}
+		return JS_EXCEPTION;
+	}
+	err = dom_document_create_element_ns(priv->parent.node, ns, name, &newnode);
+	if (ns != NULL) {
+		dom_string_unref(ns);
+	}
+	dom_string_unref(name);
+	return qjsky_node_result(ctx, err, newnode);
+%}
+
+method Document::createDocumentFragment()
+%{
+	struct dom_document_fragment *frag = NULL;
+	dom_exception err;
+
+	err = dom_document_create_document_fragment(priv->parent.node, &frag);
+	return qjsky_node_result(ctx, err, (dom_node *)frag);
+%}
+
+getter Document::head()
+%{
+	return document_first_by_tag(ctx, priv->parent.node, corestring_dom_HEAD);
+%}
+
+getter Document::body()
+%{
+	return document_first_by_tag(ctx, priv->parent.node, corestring_dom_BODY);
+%}
+
+getter Document::location()
+%{
+	JSValue global = JS_GetGlobalObject(ctx);
+	JSValue location = JS_GetPropertyStr(ctx, global, "location");
+	(void)priv;
+	JS_FreeValue(ctx, global);
+	return location;
+%}
+
+method Document::getElementById()
+%{
+	dom_element *element = NULL;
+	dom_exception exc;
+	dom_string *id = document_string_arg(ctx, argv[0]);
+
+	if (id == NULL) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_document_get_element_by_id(((node_private_t *)priv)->node,
+					     id, &element);
+	dom_string_unref(id);
+	return qjsky_node_result(ctx, exc, (dom_node *)element);
+%}
+
+getter Document::documentElement()
+%{
+	dom_element *element = NULL;
+	dom_exception exc;
+
+	exc = dom_document_get_document_element(((node_private_t *)priv)->node,
+						&element);
+	return qjsky_node_result(ctx, exc, (dom_node *)element);
+%}
+
+method Document::getElementsByTagName()
+%{
+	dom_nodelist *nodes = NULL;
+	dom_exception err;
+	dom_string *tag = document_string_arg(ctx, argv[0]);
+	JSValue list, make, proxy;
+
+	if (tag == NULL) {
+		return JS_EXCEPTION;
+	}
+	err = dom_document_get_elements_by_tag_name(((node_private_t *)priv)->node,
+						    tag, &nodes);
+	dom_string_unref(tag);
+	if (err != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, err);
+	}
+	list = qjsky_node_list___create(ctx, nodes);
+	dom_nodelist_unref(nodes);
+	if (JS_IsException(list)) {
+		return list;
+	}
+	make = qjsky_generic(ctx, "makeListProxy");
+	proxy = JS_Call(ctx, make, JS_UNDEFINED, 1, (JSValueConst *)&list);
+	JS_FreeValue(ctx, make);
+	JS_FreeValue(ctx, list);
+	return proxy;
+%}
+
+getter Document::cookie()
+%{
+	char *cookie_str;
+	JSValue ret;
+	struct html_content *htmlc = document_htmlc(priv->parent.node);
+
+	if (htmlc == NULL) {
+		return JS_NewStringLen(ctx, "", 0);
+	}
+	cookie_str = urldb_get_cookie(llcache_handle_get_url(htmlc->base.llcache), false);
+	ret = JS_NewString(ctx, cookie_str != NULL ? cookie_str : "");
+	free(cookie_str);
+	return ret;
+%}
+
+setter Document::cookie()
+%{
+	struct html_content *htmlc = document_htmlc(priv->parent.node);
+	const char *cookie_str;
+
+	if (htmlc == NULL) {
+		return JS_UNDEFINED;
+	}
+	cookie_str = JS_ToCString(ctx, val);
+	if (cookie_str == NULL) {
+		return JS_EXCEPTION;
+	}
+	/* the referer (NULL) is trusted */
+	if (!urldb_set_cookie(cookie_str,
+			      llcache_handle_get_url(htmlc->base.llcache), NULL)) {
+		NSLOG(netsurf, DEEPDEBUG, "unable to set cookie: %s", cookie_str);
+	}
+	JS_FreeCString(ctx, cookie_str);
+	return JS_UNDEFINED;
+%}
+
+method Document::createEvent()
+%{
+	/* a new event, untrusted as it comes from a script */
+	dom_event *evt = NULL;
+	dom_exception exc;
+	JSValue ret;
+
+	(void)priv;
+	exc = dom_event_create(&evt);
+	if (exc != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, exc);
+	}
+	exc = dom_event_set_is_trusted(evt, false);
+	if (exc != DOM_NO_ERR) {
+		dom_event_unref(evt);
+		return qjsky_throw_dom(ctx, exc);
+	}
+	ret = qjsky_event(ctx, evt);
+	dom_event_unref(evt);
+	return ret;
+%}
+
+getter Document::implementation()
+%{
+	JSValue impl = qjsky_get_hidden(ctx, this_val, QJSKY_HIDDEN_IMPLEMENTATION);
+
+	(void)priv;
+	if (!JS_IsUndefined(impl)) {
+		return impl;
+	}
+	impl = document_make_implementation(ctx);
+	if (JS_IsException(impl) ||
+	    qjsky_set_hidden(ctx, this_val, QJSKY_HIDDEN_IMPLEMENTATION,
+			     JS_DupValue(ctx, impl)) < 0) {
+		JS_FreeValue(ctx, impl);
+		return JS_EXCEPTION;
+	}
+	return impl;
+%}
+
+getter Document::onabort();
+setter Document::onabort();
+getter Document::onautocompleteerror();
+setter Document::onautocompleteerror();
+getter Document::onautocomplete();
+setter Document::onautocomplete();
+getter Document::onblur();
+setter Document::onblur();
+getter Document::oncancel();
+setter Document::oncancel();
+getter Document::oncanplaythrough();
+setter Document::oncanplaythrough();
+getter Document::oncanplay();
+setter Document::oncanplay();
+getter Document::onchange();
+setter Document::onchange();
+getter Document::onclick();
+setter Document::onclick();
+getter Document::onclose();
+setter Document::onclose();
+getter Document::oncontextmenu();
+setter Document::oncontextmenu();
+getter Document::oncuechange();
+setter Document::oncuechange();
+getter Document::ondblclick();
+setter Document::ondblclick();
+getter Document::ondragend();
+setter Document::ondragend();
+getter Document::ondragenter();
+setter Document::ondragenter();
+getter Document::ondragexit();
+setter Document::ondragexit();
+getter Document::ondragleave();
+setter Document::ondragleave();
+getter Document::ondragover();
+setter Document::ondragover();
+getter Document::ondragstart();
+setter Document::ondragstart();
+getter Document::ondrag();
+setter Document::ondrag();
+getter Document::ondrop();
+setter Document::ondrop();
+getter Document::ondurationchange();
+setter Document::ondurationchange();
+getter Document::onemptied();
+setter Document::onemptied();
+getter Document::onended();
+setter Document::onended();
+getter Document::onfocus();
+setter Document::onfocus();
+getter Document::oninput();
+setter Document::oninput();
+getter Document::oninvalid();
+setter Document::oninvalid();
+getter Document::onkeydown();
+setter Document::onkeydown();
+getter Document::onkeypress();
+setter Document::onkeypress();
+getter Document::onkeyup();
+setter Document::onkeyup();
+getter Document::onloadeddata();
+setter Document::onloadeddata();
+getter Document::onloadedmetadata();
+setter Document::onloadedmetadata();
+getter Document::onloadstart();
+setter Document::onloadstart();
+getter Document::onload();
+setter Document::onload();
+getter Document::onmousedown();
+setter Document::onmousedown();
+getter Document::onmouseenter();
+setter Document::onmouseenter();
+getter Document::onmouseleave();
+setter Document::onmouseleave();
+getter Document::onmousemove();
+setter Document::onmousemove();
+getter Document::onmouseout();
+setter Document::onmouseout();
+getter Document::onmouseover();
+setter Document::onmouseover();
+getter Document::onmouseup();
+setter Document::onmouseup();
+getter Document::onpause();
+setter Document::onpause();
+getter Document::onplaying();
+setter Document::onplaying();
+getter Document::onplay();
+setter Document::onplay();
+getter Document::onprogress();
+setter Document::onprogress();
+getter Document::onratechange();
+setter Document::onratechange();
+getter Document::onreadystatechange();
+setter Document::onreadystatechange();
+getter Document::onreset();
+setter Document::onreset();
+getter Document::onresize();
+setter Document::onresize();
+getter Document::onscroll();
+setter Document::onscroll();
+getter Document::onseeked();
+setter Document::onseeked();
+getter Document::onseeking();
+setter Document::onseeking();
+getter Document::onselect();
+setter Document::onselect();
+getter Document::onshow();
+setter Document::onshow();
+getter Document::onsort();
+setter Document::onsort();
+getter Document::onstalled();
+setter Document::onstalled();
+getter Document::onsubmit();
+setter Document::onsubmit();
+getter Document::onsuspend();
+setter Document::onsuspend();
+getter Document::ontimeupdate();
+setter Document::ontimeupdate();
+getter Document::ontoggle();
+setter Document::ontoggle();
+getter Document::onvolumechange();
+setter Document::onvolumechange();
+getter Document::onwaiting();
+setter Document::onwaiting();
+getter Document::onwheel();
+setter Document::onwheel();

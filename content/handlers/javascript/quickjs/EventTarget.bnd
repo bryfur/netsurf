@@ -1,0 +1,157 @@
+/* Event Target binding for browser using QuickJS-ng and libdom
+ *
+ * Copyright 2016 Daniel Silverstone <dsilvers@digital-scurf.org>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+class EventTarget {
+	private bool is_node;
+	private bool capture_registered;
+	private bool bubbling_registered;
+};
+
+prologue EventTarget()
+%{
+
+/* addEventListener's third argument: an options object, or (legacy) the
+ * capture flag; -1 with an exception pending
+ */
+static int event_listener_options(JSContext *ctx, int argc, JSValueConst *argv)
+{
+	static const struct {
+		const char *name;
+		event_listener_flags flag;
+	} options[] = {
+		{ "capture", ELF_CAPTURE },
+		{ "passive", ELF_PASSIVE },
+		{ "once", ELF_ONCE },
+	};
+	int flags = ELF_NONE;
+	size_t i;
+
+	if (argc < 3) {
+		return flags;
+	}
+	if (!JS_IsObject(argv[2])) {
+		int b = JS_ToBool(ctx, argv[2]);
+		return b < 0 ? -1 : (b ? ELF_CAPTURE : ELF_NONE);
+	}
+	for (i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+		JSValue v = JS_GetPropertyStr(ctx, argv[2], options[i].name);
+		int b = JS_ToBool(ctx, v);
+		JS_FreeValue(ctx, v);
+		if (b < 0) {
+			return -1;
+		}
+		if (b) {
+			flags |= options[i].flag;
+		}
+	}
+	return flags;
+}
+
+%}
+
+init EventTarget()
+%{
+	priv->is_node = false;
+	priv->capture_registered = false;
+	priv->bubbling_registered = false;
+%}
+
+method EventTarget::addEventListener()
+%{
+	int flags;
+	JSValue type;
+	int r;
+
+	if (argc < 2 || JS_IsNull(argv[1]) || JS_IsUndefined(argv[1])) {
+		return JS_UNDEFINED;
+	}
+	flags = event_listener_options(ctx, argc, argv);
+	if (flags < 0) {
+		return JS_EXCEPTION;
+	}
+	type = JS_ToString(ctx, argv[0]);
+	if (JS_IsException(type)) {
+		return type;
+	}
+	r = qjsky_listener_add(ctx, this_val, type, argv[1], flags);
+	if (r >= 0 && priv->is_node) {
+		/* libdom calls us for this type and phase from now on */
+		dom_string *type_s;
+		if (qjsky_dom_string(ctx, type, &type_s) != DOM_NO_ERR) {
+			JS_FreeValue(ctx, type);
+			return JS_EXCEPTION;
+		}
+		qjsky_register_event_listener_for(ctx,
+			(dom_element *)((node_private_t *)priv)->node,
+			type_s, (flags & ELF_CAPTURE) != 0);
+		dom_string_unref(type_s);
+	}
+	JS_FreeValue(ctx, type);
+	return r < 0 ? JS_EXCEPTION : JS_UNDEFINED;
+%}
+
+method EventTarget::removeEventListener()
+%{
+	int flags;
+	JSValue type;
+	int r;
+
+	(void)priv;
+	if (argc < 2) {
+		return JS_UNDEFINED;
+	}
+	flags = event_listener_options(ctx, argc, argv);
+	if (flags < 0) {
+		return JS_EXCEPTION;
+	}
+	type = JS_ToString(ctx, argv[0]);
+	if (JS_IsException(type)) {
+		return type;
+	}
+	r = qjsky_listener_remove(ctx, this_val, type, argv[1], flags);
+	JS_FreeValue(ctx, type);
+	return r < 0 ? JS_EXCEPTION : JS_UNDEFINED;
+%}
+
+method EventTarget::dispatchEvent()
+%{
+	event_private_t *evpriv;
+	dom_event *evt;
+	bool in_dispatch, is_initialised, success;
+
+	evpriv = qjsky_get_private(argv[0], &qjsky_class_event);
+	if (evpriv == NULL) {
+		return JS_ThrowTypeError(ctx, "EventTarget.dispatchEvent: argument 1 is not an Event");
+	}
+	evt = evpriv->evt;
+
+	/* https://dom.spec.whatwg.org/#dom-eventtarget-dispatchevent */
+	if (dom_event_in_dispatch(evt, &in_dispatch) != DOM_NO_ERR ||
+	    dom_event_is_initialised(evt, &is_initialised) != DOM_NO_ERR) {
+		return JS_UNDEFINED;
+	}
+	if (in_dispatch || !is_initialised) {
+		return JS_ThrowTypeError(ctx, "InvalidStateError: the event is %s",
+					 in_dispatch ? "being dispatched" : "not initialised");
+	}
+	if (dom_event_set_is_trusted(evt, false) != DOM_NO_ERR) {
+		return JS_UNDEFINED;
+	}
+
+	/** \todo dispatch against targets which are not nodes */
+	if (priv->is_node == false) {
+		return JS_UNDEFINED;
+	}
+	if (dom_event_target_dispatch_event(((node_private_t *)priv)->node,
+					    evt, &success) != DOM_NO_ERR) {
+		return JS_UNDEFINED;
+	}
+	return JS_NewBool(ctx, success);
+%}

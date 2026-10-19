@@ -1,0 +1,48 @@
+/* HTML canvas element binding using QuickJS-ng and libdom
+ *
+ * Copyright 2020 Vincent Sanders <vince@netsurf-browser.org>
+ * Copyright 2020 Daniel Silverstone <dsilvers@netsurf-browser.org>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+init HTMLCanvasElement(struct dom_html_element *html_canvas_element::html_element);
+
+getter HTMLCanvasElement::width();
+setter HTMLCanvasElement::width();
+
+getter HTMLCanvasElement::height();
+setter HTMLCanvasElement::height();
+
+method HTMLCanvasElement::getContext()
+%{
+	/* modetype[, {options}]: only "2d" */
+	const char *modetype = JS_ToCString(ctx, argv[0]);
+	JSValue context;
+	bool is2d;
+
+	if (modetype == NULL) {
+		return JS_EXCEPTION;
+	}
+	is2d = (strcmp(modetype, "2d") == 0);
+	JS_FreeCString(ctx, modetype);
+	if (!is2d) {
+		return JS_NULL;
+	}
+	context = qjsky_get_hidden(ctx, this_val, QJSKY_HIDDEN_CONTEXT2D);
+	if (!JS_IsUndefined(context)) {
+		return context;
+	}
+	context = qjsky_canvas_rendering_context2d___create(ctx,
+		(struct dom_html_element *)((node_private_t *)priv)->node);
+	if (JS_IsException(context) ||
+	    qjsky_set_hidden(ctx, this_val, QJSKY_HIDDEN_CONTEXT2D,
+			     JS_DupValue(ctx, context)) < 0) {
+		JS_FreeValue(ctx, context);
+		return JS_EXCEPTION;
+	}
+	return context;
+%}

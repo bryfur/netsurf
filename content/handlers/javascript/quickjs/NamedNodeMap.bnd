@@ -1,0 +1,61 @@
+/* NamedNodeMap binding for browser using QuickJS-ng and libdom
+ *
+ * Copyright 2020 Daniel Silverstone <dsilvers@netsurf-browser.org>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+class NamedNodeMap {
+	private struct dom_namednodemap *map;
+};
+
+init NamedNodeMap(struct dom_namednodemap *map)
+%{
+	priv->map = map;
+	dom_namednodemap_ref(map);
+%}
+
+fini NamedNodeMap()
+%{
+	dom_namednodemap_unref(priv->map);
+%}
+
+getter NamedNodeMap::length()
+%{
+	uint32_t len;
+	dom_exception err = dom_namednodemap_get_length(priv->map, &len);
+	if (err != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, err);
+	}
+	return JS_NewUint32(ctx, len);
+%}
+
+method NamedNodeMap::item()
+%{
+	uint32_t i;
+	dom_node *node = NULL;
+	dom_exception err;
+
+	if (JS_ToUint32(ctx, &i, argv[0]) < 0) {
+		return JS_EXCEPTION;
+	}
+	err = dom_namednodemap_item(priv->map, i, &node);
+	return qjsky_node_result(ctx, err, node);
+%}
+
+method NamedNodeMap::getNamedItem()
+%{
+	dom_exception exc;
+	dom_node *attr = NULL;
+	dom_string *name;
+
+	if (qjsky_dom_string(ctx, argv[0], &name) != DOM_NO_ERR) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_namednodemap_get_named_item(priv->map, name, &attr);
+	dom_string_unref(name);
+	return qjsky_node_result(ctx, exc, attr);
+%}

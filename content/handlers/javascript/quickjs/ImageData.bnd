@@ -1,0 +1,78 @@
+/* HTML canvas ImageData objects
+ *
+ * Copyright 2020 Daniel Silverstone <dsilvers@netsurf-browser.org>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+class ImageData {
+      private int width;
+      private int height;
+};
+
+prologue ImageData()
+%{
+/* the pixels of an ImageData (obj): NULL if its buffer is gone (detached,
+ * transferred); valid until scripts run again
+ */
+uint8_t *qjsky_image_data_pixels(JSContext *ctx, JSValueConst obj)
+{
+	image_data_private_t *priv = qjsky_get_private(obj, &qjsky_class_image_data);
+	JSValue data, abuf;
+	size_t offset, len, bpe, size;
+	uint8_t *pixels = NULL;
+
+	if (priv == NULL) {
+		return NULL;
+	}
+	data = qjsky_get_hidden(ctx, obj, QJSKY_HIDDEN_DATA);
+	abuf = JS_GetTypedArrayBuffer(ctx, data, &offset, &len, &bpe);
+	JS_FreeValue(ctx, data);
+	if (JS_IsException(abuf)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return NULL;
+	}
+	pixels = JS_GetArrayBuffer(ctx, &size, abuf);
+	JS_FreeValue(ctx, abuf);
+	if (pixels == NULL ||
+	    len < (size_t)priv->width * priv->height * 4 || offset + len > size) {
+		return NULL;
+	}
+	return pixels + offset;
+}
+%}
+
+init ImageData(int width, int height)
+%{
+	/* the pixels: a Uint8ClampedArray (data), zeroed */
+	JSValue len, array;
+
+	priv->width = width;
+	priv->height = height;
+	len = JS_NewInt64(ctx, (int64_t)width * height * 4);
+	array = JS_NewTypedArray(ctx, 1, &len, JS_TYPED_ARRAY_UINT8C);
+	if (JS_IsException(array)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return;
+	}
+	qjsky_set_hidden(ctx, obj, QJSKY_HIDDEN_DATA, array);
+%}
+
+getter ImageData::width()
+%{
+	return JS_NewInt32(ctx, priv->width);
+%}
+
+getter ImageData::height()
+%{
+	return JS_NewInt32(ctx, priv->height);
+%}
+
+getter ImageData::data()
+%{
+	(void)priv;
+	return qjsky_get_hidden(ctx, this_val, QJSKY_HIDDEN_DATA);
+%}

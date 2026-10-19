@@ -1,0 +1,134 @@
+/* Event binding for browser using QuickJS-ng and libdom
+ *
+ * Copyright 2015 Vincent Sanders <vince@netsurf-browser.org>
+ * Copyright 2015 Daniel Silverstone <dsilvers@netsurf-browser.org>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+class Event {
+      private dom_event *evt;
+};
+
+prologue Event()
+%{
+typedef dom_exception (*event_flag_t)(dom_event *evt, bool *flag);
+
+/* (libdom's getters are macros) */
+static dom_exception event_bubbles(dom_event *e, bool *f) { return dom_event_get_bubbles(e, f); }
+static dom_exception event_cancelable(dom_event *e, bool *f) { return dom_event_get_cancelable(e, f); }
+static dom_exception event_prevented(dom_event *e, bool *f) { return dom_event_is_default_prevented(e, f); }
+static dom_exception event_trusted(dom_event *e, bool *f) { return dom_event_get_is_trusted(e, f); }
+
+static JSValue event_flag(JSContext *ctx, dom_event *evt, event_flag_t get)
+{
+	bool ret;
+	dom_exception exc = get(evt, &ret);
+	if (exc != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, exc);
+	}
+	return JS_NewBool(ctx, ret);
+}
+%}
+
+init Event (struct dom_event *evt)
+%{
+	priv->evt = evt;
+	dom_event_ref(evt);
+%}
+
+fini Event ()
+%{
+	dom_event_unref(priv->evt);
+%}
+
+getter Event::type ()
+%{
+	dom_string *ret = NULL;
+	dom_exception exc = dom_event_get_type(priv->evt, &ret);
+	return qjsky_string_result(ctx, exc, ret, false);
+%}
+
+getter Event::target ()
+%{
+	/** \todo the Window as an event target */
+	dom_event_target *et = NULL;
+	dom_exception exc = dom_event_get_target(priv->evt, &et);
+	return qjsky_node_result(ctx, exc, (dom_node *)et);
+%}
+
+getter Event::currentTarget ()
+%{
+	dom_event_target *et = NULL;
+	dom_exception exc = dom_event_get_current_target(priv->evt, &et);
+	return qjsky_node_result(ctx, exc, (dom_node *)et);
+%}
+
+getter Event::eventPhase ()
+%{
+	dom_event_flow_phase phase;
+	dom_exception exc = dom_event_get_event_phase(priv->evt, &phase);
+	if (exc != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, exc);
+	}
+	return JS_NewUint32(ctx, phase);
+%}
+
+method Event::stopPropagation ()
+%{
+	dom_exception exc = dom_event_stop_propagation(priv->evt);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+%}
+
+method Event::stopImmediatePropagation ()
+%{
+	dom_exception exc = dom_event_stop_immediate_propagation(priv->evt);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+%}
+
+getter Event::bubbles ()
+%{
+	return event_flag(ctx, priv->evt, event_bubbles);
+%}
+
+getter Event::cancelable ()
+%{
+	return event_flag(ctx, priv->evt, event_cancelable);
+%}
+
+method Event::preventDefault ()
+%{
+	dom_exception exc = dom_event_prevent_default(priv->evt);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+%}
+
+getter Event::defaultPrevented ()
+%{
+	return event_flag(ctx, priv->evt, event_prevented);
+%}
+
+getter Event::isTrusted ()
+%{
+	return event_flag(ctx, priv->evt, event_trusted);
+%}
+
+method Event::initEvent ()
+%{
+	dom_exception exc;
+	dom_string *type;
+	int bubbles = JS_ToBool(ctx, argv[1]);
+	int cancelable = JS_ToBool(ctx, argv[2]);
+
+	if (bubbles < 0 || cancelable < 0) {
+		return JS_EXCEPTION;
+	}
+	if (qjsky_dom_string(ctx, argv[0], &type) != DOM_NO_ERR) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_event_init(priv->evt, type, bubbles, cancelable);
+	dom_string_unref(type);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+%}

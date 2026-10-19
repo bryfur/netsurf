@@ -1,0 +1,575 @@
+/* Window binding for browser using QuickJS-ng and libdom
+ *
+ * Copyright 2015 Vincent Sanders <vince@netsurf-browser.org>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+class Window {
+	private struct browser_window * win;
+	private struct html_content * htmlc;
+	private struct window_schedule_s * schedule_ring;
+	private bool closed_down;
+	prologue %{
+#include <nsutils/time.h>
+
+#include "utils/corestrings.h"
+#include "utils/nsurl.h"
+#include "netsurf/browser_window.h"
+#include "content/hlcache.h"
+#include "html/html.h"
+#include "html/private.h"
+#include "desktop/gui_internal.h"
+#include "netsurf/misc.h"
+#include "utils/ring.h"
+#include "netsurf/inttypes.h"
+
+/* timers: setTimeout, setInterval, requestAnimationFrame */
+typedef struct window_schedule_s {
+	window_private_t *owner;
+	JSContext *ctx;
+	struct window_schedule_s *r_next;
+	struct window_schedule_s *r_prev;
+	size_t handle;
+	int repeat_timeout;
+	bool running;
+	bool animation_frame; /* the callback gets a time stamp */
+	JSValue func; /* a function, or source to run */
+	int argc;
+	JSValue *argv;
+} window_schedule_t;
+
+static size_t next_handle = 1; /* 0 is never a handle: scripts test it */
+
+static void window_free_callback(JSRuntime *rt, window_schedule_t *sched)
+{
+	int i;
+
+	JS_FreeValueRT(rt, sched->func);
+	for (i = 0; i < sched->argc; i++) {
+		JS_FreeValueRT(rt, sched->argv[i]);
+	}
+	free(sched->argv);
+	free(sched);
+}
+
+static void window_run_callback(window_schedule_t *sched)
+{
+	JSContext *ctx = sched->ctx;
+	JSValue ret;
+
+	if (JS_IsFunction(ctx, sched->func)) {
+		if (sched->animation_frame) {
+			uint64_t now;
+			JSValue stamp;
+			nsu_getmonotonic_ms(&now);
+			stamp = JS_NewFloat64(ctx, (double)now);
+			ret = qjsky_call(ctx, sched->func, JS_UNDEFINED, 1, &stamp);
+		} else {
+			ret = qjsky_call(ctx, sched->func, JS_UNDEFINED,
+					 sched->argc, (JSValueConst *)sched->argv);
+		}
+	} else {
+		/* a string: run as a script */
+		size_t len;
+		const char *src = JS_ToCStringLen(ctx, &len, sched->func);
+		if (src == NULL) {
+			qjsky_log_exception(ctx, "timer");
+			return;
+		}
+		qjsky_reset_timeout(ctx);
+		ret = JS_Eval(ctx, src, len, "timer", JS_EVAL_TYPE_GLOBAL);
+		JS_FreeCString(ctx, src);
+		if (JS_IsException(ret)) {
+			qjsky_log_exception(ctx, "timer");
+		}
+	}
+	JS_FreeValue(ctx, ret);
+}
+
+static void window_schedule_callback(void *p)
+{
+	window_schedule_t *sched = (window_schedule_t *)p;
+
+	NSLOG(netsurf, DEEPDEBUG, "Timer %"PRIsizet, sched->handle);
+
+	sched->running = true;
+	window_run_callback(sched);
+	sched->running = false;
+
+	if (sched->repeat_timeout > 0) {
+		guit->misc->schedule(sched->repeat_timeout,
+				     window_schedule_callback, sched);
+	} else {
+		RING_REMOVE(sched->owner->schedule_ring, sched);
+		window_free_callback(JS_GetRuntime(sched->ctx), sched);
+	}
+}
+
+/* a timer of func (with args) in timeout ms: its handle, 0 if none */
+static size_t window_alloc_new_callback(JSContext *ctx,
+					window_private_t *window,
+					bool repeating, bool animation_frame,
+					int timeout, JSValueConst func,
+					int argc, JSValueConst *argv)
+{
+	window_schedule_t *sched;
+	int i;
+
+	if (window->closed_down) {
+		return 0;
+	}
+	sched = calloc(1, sizeof *sched);
+	if (sched == NULL) {
+		return 0;
+	}
+	if (argc > 0) {
+		sched->argv = calloc(argc, sizeof(JSValue));
+		if (sched->argv == NULL) {
+			free(sched);
+			return 0;
+		}
+	}
+	sched->owner = window;
+	sched->ctx = ctx;
+	sched->handle = next_handle++;
+	sched->repeat_timeout = repeating ? timeout : 0;
+	sched->animation_frame = animation_frame;
+	sched->func = JS_IsFunction(ctx, func) ? JS_DupValue(ctx, func) :
+		JS_ToString(ctx, func);
+	if (JS_IsException(sched->func)) {
+		free(sched->argv);
+		free(sched);
+		return 0;
+	}
+	for (i = 0; i < argc; i++) {
+		sched->argv[i] = JS_DupValue(ctx, argv[i]);
+	}
+	sched->argc = argc;
+
+	RING_INSERT(window->schedule_ring, sched);
+	guit->misc->schedule(timeout, window_schedule_callback, sched);
+	NSLOG(netsurf, DEEPDEBUG, "Timer %"PRIsizet" in %d ms",
+	      sched->handle, timeout);
+
+	return sched->handle;
+}
+
+static void window_remove_callback_by_handle(JSRuntime *rt,
+					     window_private_t *window,
+					     size_t handle)
+{
+	RING_ITERATE_START(window_schedule_t, window->schedule_ring, sched) {
+		if (sched->handle == handle) {
+			if (sched->running) {
+				/* it goes when it returns */
+				sched->repeat_timeout = 0;
+			} else {
+				guit->misc->schedule(-1, window_schedule_callback,
+						     sched);
+				RING_REMOVE(window->schedule_ring, sched);
+				window_free_callback(rt, sched);
+			}
+			RING_ITERATE_STOP(window->schedule_ring, sched);
+		}
+	} RING_ITERATE_END(window->schedule_ring, sched);
+}
+
+/* setTimeout, setInterval: (handler, timeout, args...) */
+static JSValue window_set_timer(JSContext *ctx, window_private_t *priv,
+				bool repeating, int argc, JSValueConst *argv)
+{
+	int32_t timeout = 0;
+
+	if (argc < 1) {
+		return JS_ThrowTypeError(ctx, "a handler is required");
+	}
+	if (argc >= 2 && JS_ToInt32(ctx, &timeout, argv[1]) < 0) {
+		return JS_EXCEPTION;
+	}
+	if (timeout < 10) {
+		timeout = 10;
+	}
+	return JS_NewInt64(ctx, window_alloc_new_callback(ctx, priv, repeating,
+		false, timeout, argv[0], argc > 2 ? argc - 2 : 0, argv + 2));
+}
+
+static JSValue window_clear_timer(JSContext *ctx, window_private_t *priv,
+				  int argc, JSValueConst *argv)
+{
+	int64_t handle = 0;
+
+	if (argc >= 1 && JS_ToInt64(ctx, &handle, argv[0]) < 0) {
+		return JS_EXCEPTION;
+	}
+	if (handle > 0) {
+		window_remove_callback_by_handle(JS_GetRuntime(ctx), priv,
+						 (size_t)handle);
+	}
+	return JS_UNDEFINED;
+}
+
+/* a hidden object of the window, made by make() on first use */
+static JSValue window_cached(JSContext *ctx, enum qjsky_hidden which,
+			     JSValue (*make)(JSContext *ctx, window_private_t *priv),
+			     window_private_t *priv)
+{
+	JSValue global = JS_GetGlobalObject(ctx);
+	JSValue v = qjsky_get_hidden(ctx, global, which);
+
+	if (JS_IsUndefined(v)) {
+		v = make(ctx, priv);
+		if (!JS_IsException(v) &&
+		    qjsky_set_hidden(ctx, global, which, JS_DupValue(ctx, v)) < 0) {
+			JS_FreeValue(ctx, v);
+			v = JS_EXCEPTION;
+		}
+	}
+	JS_FreeValue(ctx, global);
+	return v;
+}
+
+static JSValue window_make_console(JSContext *ctx, window_private_t *priv)
+{
+	return qjsky_console___create(ctx);
+}
+
+static JSValue window_make_location(JSContext *ctx, window_private_t *priv)
+{
+	return qjsky_location___create(ctx,
+		llcache_handle_get_url(priv->htmlc->base.llcache));
+}
+
+static JSValue window_make_navigator(JSContext *ctx, window_private_t *priv)
+{
+	return qjsky_navigator___create(ctx);
+}
+
+/* exported interface documented in qjsky.h: the browsing context closes,
+ * its timers stop (those running stop when they return)
+ */
+void qjsky_window_closedown(JSContext *ctx, void *window)
+{
+	window_private_t *priv = window;
+	JSRuntime *rt = JS_GetRuntime(ctx);
+	window_schedule_t *to_remove;
+
+	priv->closed_down = true;
+	do {
+		to_remove = NULL;
+		RING_ITERATE_START(window_schedule_t, priv->schedule_ring, sched) {
+			if (sched->running == false) {
+				to_remove = sched;
+				RING_ITERATE_STOP(priv->schedule_ring, sched);
+			} else {
+				sched->repeat_timeout = 0;
+			}
+		} RING_ITERATE_END(priv->schedule_ring, sched);
+		if (to_remove != NULL) {
+			window_remove_callback_by_handle(rt, priv, to_remove->handle);
+		}
+	} while (to_remove != NULL);
+}
+
+%};
+};
+
+init Window(struct browser_window *win, struct html_content *htmlc)
+%{
+	/* It makes no sense if win or htmlc are NULL */
+	assert(win != NULL);
+	assert(htmlc != NULL);
+	priv->win = win;
+	priv->htmlc = htmlc;
+	priv->schedule_ring = NULL;
+	priv->closed_down = false;
+	NSLOG(netsurf, DEEPDEBUG, "win=%p htmlc=%p", priv->win, priv->htmlc);
+%}
+
+fini Window()
+%{
+	/* the thread is going: every timer goes */
+	while (priv->schedule_ring != NULL) {
+		window_schedule_t *sched = priv->schedule_ring;
+		guit->misc->schedule(-1, window_schedule_callback, sched);
+		RING_REMOVE(priv->schedule_ring, sched);
+		window_free_callback(rt, sched);
+	}
+%}
+
+getter Window::document()
+%{
+	return qjsky_node(ctx, (struct dom_node *)priv->htmlc->document);
+%}
+
+getter Window::window()
+%{
+	(void)priv;
+	return JS_GetGlobalObject(ctx);
+%}
+
+getter Window::self()
+%{
+	(void)priv;
+	return JS_GetGlobalObject(ctx);
+%}
+
+getter Window::frames()
+%{
+	(void)priv;
+	return JS_GetGlobalObject(ctx);
+%}
+
+getter Window::top()
+%{
+	/** \todo frames: the top level browsing context's window */
+	(void)priv;
+	return JS_GetGlobalObject(ctx);
+%}
+
+getter Window::parent()
+%{
+	/** \todo frames: the parent browsing context's window */
+	(void)priv;
+	return JS_GetGlobalObject(ctx);
+%}
+
+getter Window::console()
+%{
+	return window_cached(ctx, QJSKY_HIDDEN_CONSOLE, window_make_console, priv);
+%}
+
+getter Window::location()
+%{
+	return window_cached(ctx, QJSKY_HIDDEN_LOCATION, window_make_location, priv);
+%}
+
+getter Window::navigator()
+%{
+	return window_cached(ctx, QJSKY_HIDDEN_NAVIGATOR, window_make_navigator, priv);
+%}
+
+getter Window::name()
+%{
+	const char *name = NULL;
+	browser_window_get_name(priv->win, &name);
+	return JS_NewString(ctx, name != NULL ? name : "");
+%}
+
+setter Window::name()
+%{
+	const char *name = JS_ToCString(ctx, val);
+	if (name == NULL) {
+		return JS_EXCEPTION;
+	}
+	browser_window_set_name(priv->win, name);
+	JS_FreeCString(ctx, name);
+	return JS_UNDEFINED;
+%}
+
+method Window::alert()
+%{
+	(void)priv;
+	if (argc == 0) {
+		NSLOG(netsurf, INFO, "JS ALERT");
+	} else {
+		size_t msg_len;
+		const char *msg = JS_ToCStringLen(ctx, &msg_len, argv[0]);
+		if (msg == NULL) {
+			return JS_EXCEPTION;
+		}
+		NSLOG(netsurf, INFO, "JS ALERT: %*s", (int)msg_len, msg);
+		JS_FreeCString(ctx, msg);
+	}
+	return JS_UNDEFINED;
+%}
+
+method Window::setTimeout()
+%{
+	return window_set_timer(ctx, priv, false, argc, argv);
+%}
+
+method Window::setInterval()
+%{
+	return window_set_timer(ctx, priv, true, argc, argv);
+%}
+
+method Window::clearTimeout()
+%{
+	return window_clear_timer(ctx, priv, argc, argv);
+%}
+
+method Window::clearInterval()
+%{
+	return window_clear_timer(ctx, priv, argc, argv);
+%}
+
+method Window::requestAnimationFrame()
+%{
+	if (!JS_IsFunction(ctx, argv[0])) {
+		return JS_ThrowTypeError(ctx, "requestAnimationFrame: the callback is not a function");
+	}
+	return JS_NewInt64(ctx, window_alloc_new_callback(ctx, priv, false,
+		true, 16, argv[0], 0, NULL));
+%}
+
+method Window::cancelAnimationFrame()
+%{
+	return window_clear_timer(ctx, priv, argc, argv);
+%}
+
+getter Window::onabort();
+setter Window::onabort();
+getter Window::onafterprint();
+setter Window::onafterprint();
+getter Window::onautocompleteerror();
+setter Window::onautocompleteerror();
+getter Window::onautocomplete();
+setter Window::onautocomplete();
+getter Window::onbeforeprint();
+setter Window::onbeforeprint();
+getter Window::onbeforeunload();
+setter Window::onbeforeunload();
+getter Window::onblur();
+setter Window::onblur();
+getter Window::oncancel();
+setter Window::oncancel();
+getter Window::oncanplaythrough();
+setter Window::oncanplaythrough();
+getter Window::oncanplay();
+setter Window::oncanplay();
+getter Window::onchange();
+setter Window::onchange();
+getter Window::onclick();
+setter Window::onclick();
+getter Window::onclose();
+setter Window::onclose();
+getter Window::oncontextmenu();
+setter Window::oncontextmenu();
+getter Window::oncuechange();
+setter Window::oncuechange();
+getter Window::ondblclick();
+setter Window::ondblclick();
+getter Window::ondragend();
+setter Window::ondragend();
+getter Window::ondragenter();
+setter Window::ondragenter();
+getter Window::ondragexit();
+setter Window::ondragexit();
+getter Window::ondragleave();
+setter Window::ondragleave();
+getter Window::ondragover();
+setter Window::ondragover();
+getter Window::ondragstart();
+setter Window::ondragstart();
+getter Window::ondrag();
+setter Window::ondrag();
+getter Window::ondrop();
+setter Window::ondrop();
+getter Window::ondurationchange();
+setter Window::ondurationchange();
+getter Window::onemptied();
+setter Window::onemptied();
+getter Window::onended();
+setter Window::onended();
+getter Window::onerror();
+setter Window::onerror();
+getter Window::onfocus();
+setter Window::onfocus();
+getter Window::onhashchange();
+setter Window::onhashchange();
+getter Window::oninput();
+setter Window::oninput();
+getter Window::oninvalid();
+setter Window::oninvalid();
+getter Window::onkeydown();
+setter Window::onkeydown();
+getter Window::onkeypress();
+setter Window::onkeypress();
+getter Window::onkeyup();
+setter Window::onkeyup();
+getter Window::onlanguagechange();
+setter Window::onlanguagechange();
+getter Window::onloadeddata();
+setter Window::onloadeddata();
+getter Window::onloadedmetadata();
+setter Window::onloadedmetadata();
+getter Window::onloadstart();
+setter Window::onloadstart();
+getter Window::onload();
+setter Window::onload();
+getter Window::onmessage();
+setter Window::onmessage();
+getter Window::onmousedown();
+setter Window::onmousedown();
+getter Window::onmouseenter();
+setter Window::onmouseenter();
+getter Window::onmouseleave();
+setter Window::onmouseleave();
+getter Window::onmousemove();
+setter Window::onmousemove();
+getter Window::onmouseout();
+setter Window::onmouseout();
+getter Window::onmouseover();
+setter Window::onmouseover();
+getter Window::onmouseup();
+setter Window::onmouseup();
+getter Window::onoffline();
+setter Window::onoffline();
+getter Window::ononline();
+setter Window::ononline();
+getter Window::onpagehide();
+setter Window::onpagehide();
+getter Window::onpageshow();
+setter Window::onpageshow();
+getter Window::onpause();
+setter Window::onpause();
+getter Window::onplaying();
+setter Window::onplaying();
+getter Window::onplay();
+setter Window::onplay();
+getter Window::onpopstate();
+setter Window::onpopstate();
+getter Window::onprogress();
+setter Window::onprogress();
+getter Window::onratechange();
+setter Window::onratechange();
+getter Window::onreset();
+setter Window::onreset();
+getter Window::onresize();
+setter Window::onresize();
+getter Window::onscroll();
+setter Window::onscroll();
+getter Window::onseeked();
+setter Window::onseeked();
+getter Window::onseeking();
+setter Window::onseeking();
+getter Window::onselect();
+setter Window::onselect();
+getter Window::onshow();
+setter Window::onshow();
+getter Window::onsort();
+setter Window::onsort();
+getter Window::onstalled();
+setter Window::onstalled();
+getter Window::onstorage();
+setter Window::onstorage();
+getter Window::onsubmit();
+setter Window::onsubmit();
+getter Window::onsuspend();
+setter Window::onsuspend();
+getter Window::ontimeupdate();
+setter Window::ontimeupdate();
+getter Window::ontoggle();
+setter Window::ontoggle();
+getter Window::onunload();
+setter Window::onunload();
+getter Window::onvolumechange();
+setter Window::onvolumechange();
+getter Window::onwaiting();
+setter Window::onwaiting();
+getter Window::onwheel();
+setter Window::onwheel();

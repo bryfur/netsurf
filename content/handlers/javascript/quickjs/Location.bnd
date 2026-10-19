@@ -1,0 +1,211 @@
+/* Location binding for browser using QuickJS-ng and libdom
+ *
+ * Copyright 2015 Vincent Sanders <vince@netsurf-browser.org>
+ * Copyright 2015 Daniel Silverstone <dsilvers@netsurf-browser.org>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+class Location {
+	private nsurl *url;
+};
+
+prologue Location()
+%{
+#include "netsurf/browser_window.h"
+
+/* some of the URL, with the punctuation the URL standard gives a lone
+ * part ("file:", "?q", "#f"); "" when it has none of it
+ */
+static JSValue location_part_punct(JSContext *ctx, nsurl *url,
+				   nsurl_component parts,
+				   const char *before, const char *after)
+{
+	char *url_s = NULL;
+	size_t url_l = 0;
+	char *buf;
+	JSValue ret;
+
+	if (nsurl_get(url, parts, &url_s, &url_l) != NSERROR_OK ||
+	    url_s == NULL || url_l == 0) {
+		free(url_s);
+		return JS_NewStringLen(ctx, "", 0);
+	}
+	if (url_s[0] == before[0] && before[0] != 0) {
+		before = "";
+	}
+	if (url_s[url_l - 1] == after[0] && after[0] != 0) {
+		after = "";
+	}
+	buf = malloc(strlen(before) + url_l + strlen(after) + 1);
+	if (buf == NULL) {
+		free(url_s);
+		return JS_ThrowOutOfMemory(ctx);
+	}
+	strcpy(buf, before);
+	memcpy(buf + strlen(before), url_s, url_l);
+	strcpy(buf + strlen(before) + url_l, after);
+	ret = JS_NewString(ctx, buf);
+	free(buf);
+	free(url_s);
+	return ret;
+}
+
+static JSValue location_part(JSContext *ctx, nsurl *url, nsurl_component parts)
+{
+	return location_part_punct(ctx, url, parts, "", "");
+}
+
+/* the browser window goes to a URL relative to the location's */
+static JSValue location_navigate(JSContext *ctx, nsurl *base, JSValueConst val,
+				 enum browser_window_nav_flags flags)
+{
+	window_private_t *priv_win = qjsky_global_private(ctx);
+	nsurl *joined;
+	const char *url;
+	nserror err;
+
+	if (priv_win == NULL) {
+		return JS_EXCEPTION;
+	}
+	if (priv_win->win == NULL) {
+		NSLOG(netsurf, INFO, "failed to get browser context");
+		return JS_UNDEFINED;
+	}
+	url = JS_ToCString(ctx, val);
+	if (url == NULL) {
+		return JS_EXCEPTION;
+	}
+	err = nsurl_join(base, url, &joined);
+	JS_FreeCString(ctx, url);
+	if (err != NSERROR_OK) {
+		return JS_ThrowSyntaxError(ctx, "Location: not a URL");
+	}
+	browser_window_navigate(priv_win->win, joined, NULL, flags,
+				NULL, NULL, NULL);
+	nsurl_unref(joined);
+	return JS_UNDEFINED;
+}
+
+static JSValue location_to_string(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	location_private_t *priv = qjsky_this_private(ctx, this_val,
+						      &qjsky_class_location);
+	if (priv == NULL) {
+		return JS_EXCEPTION;
+	}
+	return location_part(ctx, priv->url, NSURL_COMPLETE);
+}
+
+%}
+
+init Location(nsurl *url)
+%{
+	priv->url = url;
+	nsurl_ref(url);
+%}
+
+fini Location()
+%{
+	nsurl_unref(priv->url);
+%}
+
+prototype Location()
+%{
+	/* the stringifier: href */
+	if (JS_DefinePropertyValueStr(ctx, proto, "toString",
+		JS_NewCFunction(ctx, location_to_string, "toString", 0),
+		JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE) < 0) {
+		return -1;
+	}
+%}
+
+method Location::reload()
+%{
+	window_private_t *priv_win = qjsky_global_private(ctx);
+
+	(void)priv;
+	if (priv_win == NULL) {
+		return JS_EXCEPTION;
+	}
+	if (priv_win->win != NULL) {
+		browser_window_reload(priv_win->win, false);
+	} else {
+		NSLOG(netsurf, INFO, "failed to get browser context");
+	}
+	return JS_UNDEFINED;
+%}
+
+method Location::assign()
+%{
+	return location_navigate(ctx, priv->url, argv[0], BW_NAVIGATE_HISTORY);
+%}
+
+method Location::replace()
+%{
+	return location_navigate(ctx, priv->url, argv[0], BW_NAVIGATE_NONE);
+%}
+
+getter Location::href()
+%{
+	return location_part(ctx, priv->url, NSURL_COMPLETE);
+%}
+
+setter Location::href()
+%{
+	return location_navigate(ctx, priv->url, val, BW_NAVIGATE_HISTORY);
+%}
+
+getter Location::origin()
+%{
+	return location_part(ctx, priv->url, NSURL_SCHEME | NSURL_HOST | NSURL_PORT);
+%}
+
+getter Location::protocol()
+%{
+	return location_part_punct(ctx, priv->url, NSURL_SCHEME, "", ":");
+%}
+
+getter Location::username()
+%{
+	return location_part(ctx, priv->url, NSURL_USERNAME);
+%}
+
+getter Location::password()
+%{
+	return location_part(ctx, priv->url, NSURL_PASSWORD);
+%}
+
+getter Location::host()
+%{
+	return location_part(ctx, priv->url, NSURL_HOST | NSURL_PORT);
+%}
+
+getter Location::hostname()
+%{
+	return location_part(ctx, priv->url, NSURL_HOST);
+%}
+
+getter Location::port()
+%{
+	return location_part(ctx, priv->url, NSURL_PORT);
+%}
+
+getter Location::pathname()
+%{
+	return location_part(ctx, priv->url, NSURL_PATH);
+%}
+
+getter Location::search()
+%{
+	return location_part_punct(ctx, priv->url, NSURL_QUERY, "?", "");
+%}
+
+getter Location::hash()
+%{
+	return location_part_punct(ctx, priv->url, NSURL_FRAGMENT, "#", "");
+%}

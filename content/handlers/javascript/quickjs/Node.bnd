@@ -1,0 +1,472 @@
+/* Node binding for browser using QuickJS-ng and libdom
+ *
+ * Copyright 2015 Vincent Sanders <vince@netsurf-browser.org>
+ *
+ * This file is part of NetSurf, http://www.netsurf-browser.org/
+ *
+ * Released under the terms of the MIT License,
+ *         http://www.opensource.org/licenses/mit-license
+ */
+
+class Node {
+	private dom_node *node;
+	prologue %{
+
+/* the ancestors of node, node first (references held), into a[n], at
+ * most max: how many (max + 1 when there were more)
+ */
+static int node_ancestors(dom_node *node, dom_node **a, int max)
+{
+	int n = 0;
+
+	dom_node_ref(node);
+	while (node != NULL) {
+		dom_node *parent = NULL;
+		if (n == max) {
+			dom_node_unref(node);
+			return max + 1;
+		}
+		a[n++] = node;
+		if (dom_node_get_parent_node(node, &parent) != DOM_NO_ERR) {
+			parent = NULL;
+		}
+		node = parent;
+	}
+	return n;
+}
+
+static void node_unref_all(dom_node **a, int n)
+{
+	while (n-- > 0) {
+		dom_node_unref(a[n]);
+	}
+}
+
+#define NODE_DEPTH_MAX 256
+
+/* compareDocumentPosition (the DOM standard's, for nodes; libdom has
+ * none): the bits of other's position relative to node
+ */
+static uint16_t node_compare(dom_node *node, dom_node *other)
+{
+	dom_node *a[NODE_DEPTH_MAX], *b[NODE_DEPTH_MAX];
+	int na, nb, i, j;
+	uint16_t ret;
+
+	if (node == other) {
+		return 0;
+	}
+	na = node_ancestors(node, a, NODE_DEPTH_MAX);
+	nb = node_ancestors(other, b, NODE_DEPTH_MAX);
+	if (na > NODE_DEPTH_MAX || nb > NODE_DEPTH_MAX) {
+		node_unref_all(a, na > NODE_DEPTH_MAX ? NODE_DEPTH_MAX : na);
+		node_unref_all(b, nb > NODE_DEPTH_MAX ? NODE_DEPTH_MAX : nb);
+		return DOM_DOCUMENT_POSITION_DISCONNECTED |
+			DOM_DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC;
+	}
+	if (a[na - 1] != b[nb - 1]) {
+		/* different trees: consistent, arbitrary */
+		ret = DOM_DOCUMENT_POSITION_DISCONNECTED |
+			DOM_DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC |
+			((uintptr_t)a[na - 1] < (uintptr_t)b[nb - 1] ?
+			 DOM_DOCUMENT_POSITION_FOLLOWING :
+			 DOM_DOCUMENT_POSITION_PRECEDING);
+	} else {
+		/* from the root down while the chains agree */
+		for (i = na - 1, j = nb - 1; i >= 0 && j >= 0 && a[i] == b[j]; i--, j--);
+		if (i < 0) {
+			/* node is an ancestor of other */
+			ret = DOM_DOCUMENT_POSITION_CONTAINED_BY |
+				DOM_DOCUMENT_POSITION_FOLLOWING;
+		} else if (j < 0) {
+			/* other is an ancestor of node */
+			ret = DOM_DOCUMENT_POSITION_CONTAINS |
+				DOM_DOCUMENT_POSITION_PRECEDING;
+		} else {
+			/* siblings a[i], b[j] under a common parent: which first? */
+			dom_node *n = NULL, *next;
+			ret = DOM_DOCUMENT_POSITION_PRECEDING;
+			if (dom_node_get_next_sibling(a[i], &n) != DOM_NO_ERR) {
+				n = NULL;
+			}
+			while (n != NULL) {
+				if (n == b[j]) {
+					ret = DOM_DOCUMENT_POSITION_FOLLOWING;
+					dom_node_unref(n);
+					break;
+				}
+				if (dom_node_get_next_sibling(n, &next) != DOM_NO_ERR) {
+					next = NULL;
+				}
+				dom_node_unref(n);
+				n = next;
+			}
+		}
+	}
+	node_unref_all(a, na);
+	node_unref_all(b, nb);
+	return ret;
+}
+
+/* a string argument as a dom string: NULL with an exception pending */
+static dom_string *node_string_arg(JSContext *ctx, JSValueConst val)
+{
+	dom_string *str;
+	if (qjsky_dom_string(ctx, val, &str) != DOM_NO_ERR) {
+		return NULL;
+	}
+	return str;
+}
+
+%};
+};
+
+init Node(struct dom_node *node)
+%{
+	priv->node = node;
+	dom_node_ref(node);
+	priv->parent.is_node = true;
+%}
+
+fini Node()
+%{
+	dom_node_unref(priv->node);
+%}
+
+getter Node::nodeType()
+%{
+	dom_node_type ntype;
+	dom_exception exc = dom_node_get_node_type(priv->node, &ntype);
+	if (exc != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, exc);
+	}
+	return JS_NewUint32(ctx, ntype);
+%}
+
+getter Node::nodeName()
+%{
+	dom_string *str = NULL;
+	dom_exception exc = dom_node_get_node_name(priv->node, &str);
+	return qjsky_string_result(ctx, exc, str, false);
+%}
+
+getter Node::baseURI()
+%{
+	dom_string *base = NULL;
+	dom_exception exc = dom_node_get_base(priv->node, &base);
+	return qjsky_string_result(ctx, exc, base, false);
+%}
+
+getter Node::ownerDocument()
+%{
+	dom_node *doc = NULL;
+	dom_exception exc = dom_node_get_owner_document(priv->node, &doc);
+	return qjsky_node_result(ctx, exc, doc);
+%}
+
+getter Node::parentNode()
+%{
+	dom_node *pnode = NULL;
+	dom_exception exc = dom_node_get_parent_node(priv->node, &pnode);
+	return qjsky_node_result(ctx, exc, pnode);
+%}
+
+getter Node::parentElement()
+%{
+	dom_node *pnode = NULL;
+	dom_node_type ntype;
+	dom_exception exc = dom_node_get_parent_node(priv->node, &pnode);
+	if (exc == DOM_NO_ERR && pnode != NULL &&
+	    (dom_node_get_node_type(pnode, &ntype) != DOM_NO_ERR ||
+	     ntype != DOM_ELEMENT_NODE)) {
+		dom_node_unref(pnode);
+		pnode = NULL;
+	}
+	return qjsky_node_result(ctx, exc, pnode);
+%}
+
+method Node::hasChildNodes()
+%{
+	bool res;
+	dom_exception exc = dom_node_has_child_nodes(priv->node, &res);
+	if (exc != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, exc);
+	}
+	return JS_NewBool(ctx, res);
+%}
+
+getter Node::childNodes()
+%{
+	JSValue list, proxy, make;
+	dom_nodelist *nlist = NULL;
+	dom_exception exc;
+
+	proxy = qjsky_get_hidden(ctx, this_val, QJSKY_HIDDEN_CHILD_NODES);
+	if (!JS_IsUndefined(proxy)) {
+		return proxy;
+	}
+	exc = dom_node_get_child_nodes(priv->node, &nlist);
+	if (exc != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, exc);
+	}
+	list = qjsky_node_list___create(ctx, nlist);
+	dom_nodelist_unref(nlist);
+	if (JS_IsException(list)) {
+		return list;
+	}
+	make = qjsky_generic(ctx, "makeListProxy");
+	proxy = JS_Call(ctx, make, JS_UNDEFINED, 1, (JSValueConst *)&list);
+	JS_FreeValue(ctx, make);
+	JS_FreeValue(ctx, list);
+	if (JS_IsException(proxy) ||
+	    qjsky_set_hidden(ctx, this_val, QJSKY_HIDDEN_CHILD_NODES,
+			     JS_DupValue(ctx, proxy)) < 0) {
+		JS_FreeValue(ctx, proxy);
+		return JS_EXCEPTION;
+	}
+	return proxy;
+%}
+
+getter Node::firstChild()
+%{
+	dom_node *n = NULL;
+	dom_exception exc = dom_node_get_first_child(priv->node, &n);
+	return qjsky_node_result(ctx, exc, n);
+%}
+
+getter Node::lastChild()
+%{
+	dom_node *n = NULL;
+	dom_exception exc = dom_node_get_last_child(priv->node, &n);
+	return qjsky_node_result(ctx, exc, n);
+%}
+
+getter Node::previousSibling()
+%{
+	dom_node *n = NULL;
+	dom_exception exc = dom_node_get_previous_sibling(priv->node, &n);
+	return qjsky_node_result(ctx, exc, n);
+%}
+
+getter Node::nextSibling()
+%{
+	dom_node *n = NULL;
+	dom_exception exc = dom_node_get_next_sibling(priv->node, &n);
+	return qjsky_node_result(ctx, exc, n);
+%}
+
+getter Node::nodeValue()
+%{
+	dom_string *content = NULL;
+	dom_exception exc = dom_node_get_node_value(priv->node, &content);
+	return qjsky_string_result(ctx, exc, content, true);
+%}
+
+setter Node::nodeValue()
+%{
+	dom_exception exc;
+	dom_string *content = node_string_arg(ctx, val);
+	if (content == NULL) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_node_set_node_value(priv->node, content);
+	dom_string_unref(content);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+%}
+
+getter Node::textContent()
+%{
+	dom_string *content = NULL;
+	dom_exception exc = dom_node_get_text_content(priv->node, &content);
+	return qjsky_string_result(ctx, exc, content, true);
+%}
+
+setter Node::textContent()
+%{
+	dom_exception exc;
+	dom_string *content = node_string_arg(ctx, val);
+	if (content == NULL) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_node_set_text_content(priv->node, content);
+	dom_string_unref(content);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+%}
+
+method Node::normalize()
+%{
+	dom_exception exc = dom_node_normalize(priv->node);
+	return exc == DOM_NO_ERR ? JS_UNDEFINED : qjsky_throw_dom(ctx, exc);
+%}
+
+method Node::cloneNode()
+%{
+	dom_node *clone = NULL;
+	int deep = JS_ToBool(ctx, argv[0]);
+	dom_exception exc;
+
+	if (deep < 0) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_node_clone_node(priv->node, deep, &clone);
+	return qjsky_node_result(ctx, exc, clone);
+%}
+
+method Node::isEqualNode()
+%{
+	bool result;
+	dom_node *other = qjsky_value_node(argv[0]);
+	dom_exception exc;
+
+	if (other == NULL) {
+		return JS_FALSE;
+	}
+	exc = dom_node_is_equal(priv->node, other, &result);
+	if (exc != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, exc);
+	}
+	return JS_NewBool(ctx, result);
+%}
+
+method Node::compareDocumentPosition()
+%{
+	uint16_t ret;
+	dom_node *other = qjsky_value_node(argv[0]);
+	dom_exception exc;
+
+	if (other == NULL) {
+		return JS_ThrowTypeError(ctx, "Node.compareDocumentPosition: not a Node");
+	}
+	(void)exc;
+	ret = node_compare(priv->node, other);
+	return JS_NewUint32(ctx, ret);
+%}
+
+method Node::contains()
+%{
+	uint16_t ret;
+	dom_node *other = qjsky_value_node(argv[0]);
+	dom_exception exc;
+
+	if (other == NULL) {
+		return JS_FALSE;
+	}
+	/* inclusive: the node itself, or one of its descendants */
+	(void)exc;
+	if (priv->node == other) {
+		return JS_TRUE;
+	}
+	ret = node_compare(priv->node, other);
+	return JS_NewBool(ctx, (ret & DOM_DOCUMENT_POSITION_CONTAINED_BY) != 0);
+%}
+
+method Node::lookupPrefix()
+%{
+	dom_string *ns, *pfx = NULL;
+	dom_exception exc;
+
+	if (JS_IsNull(argv[0])) {
+		return JS_NULL;
+	}
+	ns = node_string_arg(ctx, argv[0]);
+	if (ns == NULL) {
+		return JS_EXCEPTION;
+	}
+	exc = dom_node_lookup_prefix(priv->node, ns, &pfx);
+	dom_string_unref(ns);
+	return qjsky_string_result(ctx, exc, pfx, true);
+%}
+
+method Node::lookupNamespaceURI()
+%{
+	dom_string *ns = NULL, *pfx = NULL;
+	dom_exception exc;
+
+	if (!JS_IsNull(argv[0])) {
+		pfx = node_string_arg(ctx, argv[0]);
+		if (pfx == NULL) {
+			return JS_EXCEPTION;
+		}
+	}
+	exc = dom_node_lookup_namespace(priv->node, pfx, &ns);
+	if (pfx != NULL) {
+		dom_string_unref(pfx);
+	}
+	return qjsky_string_result(ctx, exc, ns, true);
+%}
+
+method Node::isDefaultNamespace()
+%{
+	dom_string *ns = NULL;
+	bool ret;
+	dom_exception exc;
+
+	if (!JS_IsNull(argv[0])) {
+		ns = node_string_arg(ctx, argv[0]);
+		if (ns == NULL) {
+			return JS_EXCEPTION;
+		}
+	}
+	exc = dom_node_is_default_namespace(priv->node, ns, &ret);
+	if (ns != NULL) {
+		dom_string_unref(ns);
+	}
+	if (exc != DOM_NO_ERR) {
+		return qjsky_throw_dom(ctx, exc);
+	}
+	return JS_NewBool(ctx, ret);
+%}
+
+method Node::insertBefore()
+%{
+	dom_node *node = qjsky_value_node(argv[0]);
+	dom_node *before = qjsky_value_node(argv[1]);
+	dom_node *spare = NULL;
+	dom_exception exc;
+
+	if (node == NULL) {
+		return JS_ThrowTypeError(ctx, "Node.insertBefore: argument 1 is not a Node");
+	}
+	exc = dom_node_insert_before(priv->node, node, before, &spare);
+	return qjsky_node_result(ctx, exc, spare);
+%}
+
+method Node::appendChild()
+%{
+	dom_node *node = qjsky_value_node(argv[0]);
+	dom_node *spare = NULL;
+	dom_exception exc;
+
+	if (node == NULL) {
+		return JS_ThrowTypeError(ctx, "Node.appendChild: argument 1 is not a Node");
+	}
+	exc = dom_node_append_child(priv->node, node, &spare);
+	return qjsky_node_result(ctx, exc, spare);
+%}
+
+method Node::replaceChild()
+%{
+	dom_node *node = qjsky_value_node(argv[0]);
+	dom_node *old = qjsky_value_node(argv[1]);
+	dom_node *spare = NULL;
+	dom_exception exc;
+
+	if (node == NULL || old == NULL) {
+		return JS_ThrowTypeError(ctx, "Node.replaceChild: the arguments are not Nodes");
+	}
+	exc = dom_node_replace_child(priv->node, node, old, &spare);
+	return qjsky_node_result(ctx, exc, spare);
+%}
+
+method Node::removeChild()
+%{
+	dom_node *node = qjsky_value_node(argv[0]);
+	dom_node *spare = NULL;
+	dom_exception exc;
+
+	if (node == NULL) {
+		return JS_ThrowTypeError(ctx, "Node.removeChild: argument 1 is not a Node");
+	}
+	exc = dom_node_remove_child(priv->node, node, &spare);
+	return qjsky_node_result(ctx, exc, spare);
+%}
