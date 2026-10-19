@@ -61,6 +61,7 @@
 #include "quickjs/selectors.js.inc"
 #include "quickjs/net.js.inc"
 #include "quickjs/domexception.js.inc"
+#include "quickjs/style.js.inc"
 #include "quickjs/web.js.inc"
 
 #include "qjsky.h"
@@ -84,7 +85,8 @@
 #endif
 
 /* the modules made on demand (below) */
-enum { MODULE_SELECTORS, MODULE_NET, MODULE_DOMEXCEPTION, MODULE_WEB, MODULE_COUNT };
+enum { MODULE_SELECTORS, MODULE_NET, MODULE_DOMEXCEPTION, MODULE_WEB, MODULE_STYLE,
+       MODULE_COUNT };
 static JSValue module_exports(JSContext *ctx, int m);
 
 /* pointer -> object, one per page for nodes and for events (open
@@ -2025,6 +2027,7 @@ static const struct {
 	[MODULE_DOMEXCEPTION] = { "domexception.js", domexception_js, &domexception_js_len, NULL, 0 },
 	[MODULE_WEB] = { "web.js", web_js, &web_js_len, web_natives,
 			 sizeof(web_natives) / sizeof(web_natives[0]) },
+	[MODULE_STYLE] = { "style.js", style_js, &style_js_len, NULL, 0 },
 };
 
 /* a module's exports (made the first time: its source evaluated, the
@@ -2067,6 +2070,23 @@ static JSValue module_exports(JSContext *ctx, int m)
 	thread->modules[m] = JS_DupValue(ctx, exports);
 	mem_report(JS_GetRuntime(ctx), modules[m].name);
 	return exports;
+}
+
+/* element.style (HTMLElement.bnd): the style module's declaration over
+ * the element's style attribute; a new reference, or JS_EXCEPTION
+ */
+JSValue qjsky_style_declaration(JSContext *ctx, JSValueConst element)
+{
+	JSValue exports = module_exports(ctx, MODULE_STYLE), fn, ret;
+
+	if (JS_IsException(exports)) {
+		return exports;
+	}
+	fn = JS_GetPropertyStr(ctx, exports, "declaration");
+	JS_FreeValue(ctx, exports);
+	ret = JS_Call(ctx, fn, JS_UNDEFINED, 1, &element);
+	JS_FreeValue(ctx, fn);
+	return ret;
 }
 
 /* a lazy property's value: the export of its name (opaque: the module) */

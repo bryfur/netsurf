@@ -238,8 +238,8 @@ setter HTMLElement::onwheel();
 
 getter HTMLElement::style()
 %{
-	/* a minimal CSSStyleDeclaration (Modernizr loops without one, c.f.
-	 * #2413), one per element so what is set on it stays
+	/* a CSSStyleDeclaration over the style attribute (style.js), one
+	 * per element
 	 */
 	JSValue style = qjsky_get_hidden(ctx, this_val, QJSKY_HIDDEN_STYLE);
 
@@ -247,7 +247,7 @@ getter HTMLElement::style()
 	if (!JS_IsUndefined(style)) {
 		return style;
 	}
-	style = qjsky_css_style_declaration___create(ctx);
+	style = qjsky_style_declaration(ctx, this_val);
 	if (JS_IsException(style) ||
 	    qjsky_set_hidden(ctx, this_val, QJSKY_HIDDEN_STYLE,
 			     JS_DupValue(ctx, style)) < 0) {

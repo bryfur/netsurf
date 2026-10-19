@@ -599,12 +599,16 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
 
 		if (props.containing_block->type == BOX_FLEX ||
 		    props.containing_block->type == BOX_INLINE_FLEX) {
-			/* Blockification */
+			/* Blockification: each element a flex item of its own
+			 * (CSS Flexbox 4: an inline <span> too; runs of text
+			 * stay anonymous items in an inline container)
+			 */
 			switch (box->type) {
 			case BOX_INLINE_FLEX:
 				box->type = BOX_FLEX;
 				break;
 			case BOX_INLINE_BLOCK:
+			case BOX_INLINE:
 				box->type = BOX_BLOCK;
 				break;
 			default:

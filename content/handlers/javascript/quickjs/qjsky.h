@@ -183,6 +183,7 @@ bool qjsky_node_box(struct dom_node *node, int *x, int *y, int *width,
 		    int *height, struct box **box);
 
 /** A DOMRect (web.js's) of x, y, width, height: a new reference */
+JSValue qjsky_style_declaration(JSContext *ctx, JSValueConst element);
 JSValue qjsky_dom_rect(JSContext *ctx, double x, double y, double width,
 		       double height);
 

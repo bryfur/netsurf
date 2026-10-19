@@ -812,6 +812,10 @@ static bool layout_flex__place_line_items_main(
 	size_t item_count = line->first + line->count;
 	int extra_remainder = 0;
 	int extra = 0;
+	int dir = ctx->main_reversed ? -1 : 1;
+	int lead = 0;
+	int gap = 0;
+	int gap_remainder = 0;
 
 	if (ctx->main_reversed) {
 		main_pos = lh__box_size_main(ctx->horizontal, ctx->flex) -
@@ -821,13 +825,53 @@ static bool layout_flex__place_line_items_main(
 	if (ctx->available_main != AUTO &&
 	    ctx->available_main != UNKNOWN_WIDTH &&
 	    ctx->available_main > line->used_main_size) {
+		int free = ctx->available_main - line->used_main_size;
+
 		if (line->main_auto_margin_count > 0) {
-			extra = ctx->available_main - line->used_main_size;
+			extra = free;
 
 			extra_remainder = extra % line->main_auto_margin_count;
 			extra /= line->main_auto_margin_count;
+		} else {
+			/* justify-content: the free space before the items and
+			 * between them (auto margins, above, take it first)
+			 */
+			int n = 0;
+
+			for (size_t i = line->first; i < item_count; i++) {
+				n += !lh__box_is_absolute(ctx->item.data[i].box);
+			}
+
+			switch (css_computed_justify_content(ctx->flex->style)) {
+			case CSS_JUSTIFY_CONTENT_FLEX_END:
+				lead = free;
+				break;
+			case CSS_JUSTIFY_CONTENT_CENTER:
+				lead = free / 2;
+				break;
+			case CSS_JUSTIFY_CONTENT_SPACE_BETWEEN:
+				if (n > 1) {
+					gap = free / (n - 1);
+					gap_remainder = free % (n - 1);
+				}
+				break;
+			case CSS_JUSTIFY_CONTENT_SPACE_AROUND:
+				if (n > 0) {
+					gap = free / n;
+					lead = gap / 2;
+				}
+				break;
+			case CSS_JUSTIFY_CONTENT_SPACE_EVENLY:
+				gap = free / (n + 1);
+				lead = gap;
+				break;
+			default:
+				break;
+			}
 		}
 	}
+
+	main_pos += dir * lead;
 
 	for (size_t i = line->first; i < item_count; i++) {
 		enum box_side main_end = ctx->horizontal ? RIGHT : BOTTOM;
@@ -877,6 +921,11 @@ static bool layout_flex__place_line_items_main(
 			main_pos += post_multiplier *
 					(extra_total + box_size_main +
 					 lh__delta_outer_main(ctx->flex, b));
+			main_pos += dir * gap;
+			if (gap_remainder > 0) {
+				main_pos += dir;
+				gap_remainder--;
+			}
 
 			cross_size = box_size_cross + lh__delta_outer_cross(
 					ctx->flex, b);
