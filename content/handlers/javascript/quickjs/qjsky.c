@@ -75,7 +75,7 @@ struct qjsky_map {
  * a heap: a runtime
  */
 struct jsheap {
-	JSRuntime *rt;
+	JSRuntime *rt; /* made when a page first needs it */
 	bool pending_destroy;
 	unsigned int live_threads;
 	uint64_t exec_start_time;
@@ -87,9 +87,12 @@ struct jsheap {
  */
 struct jsthread {
 	bool pending_destroy;
+	bool failed; /* its context could not be made */
 	unsigned int in_use;
 	jsheap *heap;
-	JSContext *ctx;
+	JSContext *ctx; /* made when the page first needs it (thread_context) */
+	void *win_priv; /* the browser window and content, for the Window */
+	void *doc_priv;
 	void *window; /* the Window's private struct (the global object's) */
 	JSValue generics; /* generics.js's NetSurf object */
 	struct qjsky_map nodes;
@@ -975,63 +978,23 @@ static void call_listener(JSContext *ctx, JSValueConst callback,
 	JS_FreeValue(ctx, ret);
 }
 
-/**
- * libdom's listener: the on<event> handler (target and bubbling phases)
- * and the listeners added for this phase.  A capture registration (pw's
- * low bit) runs the capturing listeners, a bubble registration the
- * others and the handler: at the target libdom calls both.
+/* target's listeners for type and this phase (capture or not) called
+ * with event, on a copy of the list: listeners added meanwhile wait for
+ * the next event, removed ones are marked (entry[2]) and skipped
  */
-static void generic_event_handler(dom_event *evt, void *pw)
+static void run_listeners(JSContext *ctx, JSValueConst target, JSValueConst type,
+			  JSValueConst event, bool capture)
 {
-	JSContext *ctx = (JSContext *)((uintptr_t)pw & ~(uintptr_t)1);
-	bool capture = ((uintptr_t)pw & 1) != 0;
-	jsthread *thread = thread_of(ctx);
-	dom_string *name;
-	dom_event_target *targ;
-	JSValue node, event, type, list, copy;
+	JSValue list, copy;
 	int64_t len, i;
 
-	if (thread == NULL || thread->pending_destroy) {
-		return;
-	}
-	if (dom_event_get_type(evt, &name) != DOM_NO_ERR) {
-		return;
-	}
-	if (dom_event_get_current_target(evt, &targ) != DOM_NO_ERR) {
-		dom_string_unref(name);
-		return;
-	}
-
-	thread->in_use++;
-	node = qjsky_node(ctx, (struct dom_node *)targ);
-	event = qjsky_event(ctx, evt);
-	if (JS_IsException(node) || JS_IsException(event)) {
-		qjsky_log_exception(ctx, "event");
-		goto out;
-	}
-
-	if (!capture) {
-		JSValue handler = qjsky_get_event_handler(ctx, node, name, targ);
-		if (JS_IsFunction(ctx, handler)) {
-			JSValue ret = qjsky_call(ctx, handler, node, 1,
-						 (JSValueConst *)&event);
-			if (JS_IsBool(ret) && !JS_ToBool(ctx, ret)) {
-				dom_event_prevent_default(evt);
-			}
-			JS_FreeValue(ctx, ret);
-		}
-		JS_FreeValue(ctx, handler);
-	}
-
-	type = qjsky_string(ctx, name);
 	{
 		bool created;
-		list = listeners_for(ctx, node, type, false, &created);
+		list = listeners_for(ctx, target, type, false, &created);
 	}
-	JS_FreeValue(ctx, type);
 	if (!JS_IsObject(list)) {
 		JS_FreeValue(ctx, list);
-		goto out;
+		return;
 	}
 
 	/* a copy: listeners added during the dispatch wait for the next one,
@@ -1067,13 +1030,65 @@ static void generic_event_handler(dom_event *evt, void *pw)
 		}
 		{
 			JSValue cb = JS_GetPropertyUint32(ctx, entry, 0);
-			call_listener(ctx, cb, node, event);
+			call_listener(ctx, cb, target, event);
 			JS_FreeValue(ctx, cb);
 		}
 		JS_FreeValue(ctx, entry);
 	}
 	JS_FreeValue(ctx, copy);
 	JS_FreeValue(ctx, list);
+}
+
+/**
+ * libdom's listener: the on<event> handler (target and bubbling phases)
+ * and the listeners added for this phase.  A capture registration (pw's
+ * low bit) runs the capturing listeners, a bubble registration the
+ * others and the handler: at the target libdom calls both.
+ */
+static void generic_event_handler(dom_event *evt, void *pw)
+{
+	JSContext *ctx = (JSContext *)((uintptr_t)pw & ~(uintptr_t)1);
+	bool capture = ((uintptr_t)pw & 1) != 0;
+	jsthread *thread = thread_of(ctx);
+	dom_string *name;
+	dom_event_target *targ;
+	JSValue node, event, type;
+
+	if (thread == NULL || thread->pending_destroy) {
+		return;
+	}
+	if (dom_event_get_type(evt, &name) != DOM_NO_ERR) {
+		return;
+	}
+	if (dom_event_get_current_target(evt, &targ) != DOM_NO_ERR) {
+		dom_string_unref(name);
+		return;
+	}
+
+	thread->in_use++;
+	node = qjsky_node(ctx, (struct dom_node *)targ);
+	event = qjsky_event(ctx, evt);
+	if (JS_IsException(node) || JS_IsException(event)) {
+		qjsky_log_exception(ctx, "event");
+		goto out;
+	}
+
+	if (!capture) {
+		JSValue handler = qjsky_get_event_handler(ctx, node, name, targ);
+		if (JS_IsFunction(ctx, handler)) {
+			JSValue ret = qjsky_call(ctx, handler, node, 1,
+						 (JSValueConst *)&event);
+			if (JS_IsBool(ret) && !JS_ToBool(ctx, ret)) {
+				dom_event_prevent_default(evt);
+			}
+			JS_FreeValue(ctx, ret);
+		}
+		JS_FreeValue(ctx, handler);
+	}
+
+	type = qjsky_string(ctx, name);
+	run_listeners(ctx, node, type, event, capture);
+	JS_FreeValue(ctx, type);
 
 out:
 	JS_FreeValue(ctx, event);
@@ -1156,22 +1171,30 @@ nserror js_newheap(int timeout, jsheap **heap)
 	if (ret == NULL) {
 		return NSERROR_NOMEM;
 	}
-	ret->rt = JS_NewRuntime();
-	if (ret->rt == NULL) {
-		free(ret);
-		return NSERROR_NOMEM;
-	}
-	JS_SetRuntimeOpaque(ret->rt, ret);
-	JS_SetMaxStackSize(ret->rt, NETSURF_JS_STACK);
-	JS_SetInterruptHandler(ret->rt, interrupt_handler, ret);
-	if (qjsky_runtime_init(ret->rt) < 0) {
-		JS_FreeRuntime(ret->rt);
-		free(ret);
-		return NSERROR_NOMEM;
-	}
-
 	*heap = ret;
 	return NSERROR_OK;
+}
+
+/* the heap's runtime, made the first time a page needs one: NULL without
+ * memory
+ */
+static JSRuntime *heap_runtime(jsheap *heap)
+{
+	if (heap->rt != NULL) {
+		return heap->rt;
+	}
+	heap->rt = JS_NewRuntime();
+	if (heap->rt == NULL) {
+		return NULL;
+	}
+	JS_SetRuntimeOpaque(heap->rt, heap);
+	JS_SetMaxStackSize(heap->rt, NETSURF_JS_STACK);
+	JS_SetInterruptHandler(heap->rt, interrupt_handler, heap);
+	if (qjsky_runtime_init(heap->rt) < 0) {
+		JS_FreeRuntime(heap->rt);
+		heap->rt = NULL;
+	}
+	return heap->rt;
 }
 
 static void destroyheap(jsheap *heap)
@@ -1180,12 +1203,14 @@ static void destroyheap(jsheap *heap)
 
 	assert(heap->pending_destroy == true);
 	assert(heap->live_threads == 0);
-	for (i = 0; i < QJSKY_HIDDEN_COUNT; i++) {
-		if (heap->hidden[i] != JS_ATOM_NULL) {
-			JS_FreeAtomRT(heap->rt, heap->hidden[i]);
+	if (heap->rt != NULL) {
+		for (i = 0; i < QJSKY_HIDDEN_COUNT; i++) {
+			if (heap->hidden[i] != JS_ATOM_NULL) {
+				JS_FreeAtomRT(heap->rt, heap->hidden[i]);
+			}
 		}
+		JS_FreeRuntime(heap->rt);
 	}
-	JS_FreeRuntime(heap->rt);
 	free(heap);
 }
 
@@ -1220,11 +1245,35 @@ static int run_internal(JSContext *ctx, const unsigned char *src, size_t len,
 	return 0;
 }
 
-/* exported interface documented in js.h */
+/* NETSURF_JS_MEM set: the runtime's memory at the stages of a page's
+ * context, on stdout (what a page costs)
+ */
+static void mem_report(JSRuntime *rt, const char *stage)
+{
+	static int on = -1;
+	JSMemoryUsage u;
+
+	if (on < 0) {
+		on = getenv("NETSURF_JS_MEM") != NULL;
+	}
+	if (!on) {
+		return;
+	}
+	JS_ComputeMemoryUsage(rt, &u);
+	printf("jsmem: %-12s %7lld bytes in %6lld blocks, %5lld objects, %5lld functions (%lld bytes of bytecode), %5lld atoms, %4lld shapes\n",
+	       stage, (long long)u.malloc_size, (long long)u.malloc_count,
+	       (long long)u.obj_count, (long long)u.js_func_count,
+	       (long long)u.js_func_code_size, (long long)u.atom_count,
+	       (long long)u.shape_count);
+}
+
+/* exported interface documented in js.h: the page recorded, its context
+ * made when it first runs a script or has a handler (a page without
+ * scripts costs nothing)
+ */
 nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv, jsthread **thread)
 {
 	jsthread *ret;
-	JSValue global, proto;
 	int i;
 
 	assert(heap != NULL);
@@ -1235,62 +1284,95 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv, jsthread **th
 		return NSERROR_NOMEM;
 	}
 	ret->heap = heap;
+	ret->win_priv = win_priv;
+	ret->doc_priv = doc_priv;
 	ret->generics = JS_UNDEFINED;
 	for (i = 0; i < 2 * QJSKY_CLASS_COUNT; i++) {
 		ret->classes[i] = JS_UNDEFINED;
 	}
-
-	ret->ctx = JS_NewContext(heap->rt);
-	if (ret->ctx == NULL) {
-		free(ret);
-		return NSERROR_NOMEM;
-	}
-	JS_SetContextOpaque(ret->ctx, ret);
 	heap->live_threads++;
-
-	/* the global object is the Window */
-	global = JS_GetGlobalObject(ret->ctx);
-	proto = qjsky_proto(ret->ctx, &qjsky_class_window);
-	if (JS_IsException(proto) ||
-	    JS_SetPrototype(ret->ctx, global, proto) < 0 ||
-	    qjsky_define_interfaces(ret->ctx, global) < 0) {
-		JS_FreeValue(ret->ctx, proto);
-		JS_FreeValue(ret->ctx, global);
-		goto fail;
-	}
-	JS_FreeValue(ret->ctx, proto);
-	ret->window = qjsky_window___create_global(ret->ctx, global,
-						   win_priv, doc_priv);
-	if (ret->window == NULL) {
-		JS_FreeValue(ret->ctx, global);
-		goto fail;
-	}
-
-	/* the polyfills, then NetSurf's generics (taken off the global) */
-	if (run_internal(ret->ctx, polyfill_js, polyfill_js_len, "polyfill.js") < 0 ||
-	    run_internal(ret->ctx, generics_js, generics_js_len, "generics.js") < 0) {
-		JS_FreeValue(ret->ctx, global);
-		goto fail;
-	}
-	ret->generics = JS_GetPropertyStr(ret->ctx, global, "NetSurf");
-	JS_DeleteProperty(ret->ctx, global, JS_NewAtom(ret->ctx, "NetSurf"), 0);
-	JS_FreeValue(ret->ctx, global);
-
-	NSLOG(netsurf, DEBUG, "New thread %p in heap %p", ret, heap);
 	*thread = ret;
 	return NSERROR_OK;
+}
+
+/* a page's context, made the first time (the Window, the polyfills): NULL
+ * if it cannot be
+ */
+static JSContext *thread_context(jsthread *thread)
+{
+	JSRuntime *rt;
+	JSContext *ctx;
+	JSValue global, proto;
+
+	if (thread->failed) {
+		return NULL;
+	}
+	if (thread->ctx != NULL) {
+		return thread->ctx;
+	}
+	rt = heap_runtime(thread->heap);
+	if (rt == NULL) {
+		thread->failed = true;
+		return NULL;
+	}
+
+	mem_report(rt, "before");
+	ctx = JS_NewContext(rt);
+	if (ctx == NULL) {
+		thread->failed = true;
+		return NULL;
+	}
+	mem_report(rt, "context");
+	thread->ctx = ctx;
+	JS_SetContextOpaque(ctx, thread);
+
+	/* the global object is the Window */
+	global = JS_GetGlobalObject(ctx);
+	proto = qjsky_proto(ctx, &qjsky_class_window);
+	if (JS_IsException(proto) ||
+	    JS_SetPrototype(ctx, global, proto) < 0 ||
+	    qjsky_define_interfaces(ctx, global) < 0) {
+		JS_FreeValue(ctx, proto);
+		JS_FreeValue(ctx, global);
+		goto fail;
+	}
+	JS_FreeValue(ctx, proto);
+	thread->window = qjsky_window___create_global(ctx, global,
+						      thread->win_priv,
+						      thread->doc_priv);
+	if (thread->window == NULL) {
+		JS_FreeValue(ctx, global);
+		goto fail;
+	}
+	mem_report(rt, "window");
+
+	/* the polyfills, then NetSurf's generics (taken off the global) */
+	if (run_internal(ctx, polyfill_js, polyfill_js_len, "polyfill.js") < 0 ||
+	    run_internal(ctx, generics_js, generics_js_len, "generics.js") < 0) {
+		JS_FreeValue(ctx, global);
+		goto fail;
+	}
+	mem_report(rt, "polyfills");
+	thread->generics = JS_GetPropertyStr(ctx, global, "NetSurf");
+	{
+		JSAtom atom = JS_NewAtom(ctx, "NetSurf");
+		JS_DeleteProperty(ctx, global, atom, 0);
+		JS_FreeAtom(ctx, atom);
+	}
+	JS_FreeValue(ctx, global);
+	NSLOG(netsurf, DEBUG, "Thread %p's context made", thread);
+	return ctx;
 
 fail:
-	NSLOG(netsurf, CRITICAL, "Unable to set up a JavaScript thread");
-	ret->pending_destroy = true;
-	js_destroythread(ret);
-	return NSERROR_INIT_FAILED;
+	NSLOG(netsurf, CRITICAL, "Unable to set up a JavaScript context");
+	thread->failed = true;
+	return NULL;
 }
 
 /* exported interface documented in js.h */
 nserror js_closethread(jsthread *thread)
 {
-	if (thread->window != NULL) {
+	if (thread->ctx != NULL && thread->window != NULL) {
 		qjsky_window_closedown(thread->ctx, thread->window);
 	}
 	return NSERROR_OK;
@@ -1305,6 +1387,15 @@ static void destroythread(jsthread *thread)
 	assert(thread->in_use == 0);
 	assert(thread->pending_destroy == true);
 
+	if (ctx == NULL) {
+		/* it never ran anything */
+		free(thread);
+		heap->live_threads--;
+		if (heap->pending_destroy && heap->live_threads == 0) {
+			destroyheap(heap);
+		}
+		return;
+	}
 	if (thread->window != NULL) {
 		qjsky_window_closedown(ctx, thread->window);
 	}
@@ -1350,7 +1441,10 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 	if (txt == NULL || txtlen == 0 || thread->pending_destroy) {
 		return false;
 	}
-	ctx = thread->ctx;
+	ctx = thread_context(thread);
+	if (ctx == NULL) {
+		return false;
+	}
 
 	/* QuickJS wants the source NUL terminated */
 	buf = malloc(txtlen + 1);
@@ -1426,8 +1520,11 @@ void js_handle_new_element(jsthread *thread, struct dom_element *node)
 				dom_string *sub = NULL;
 				if (dom_string_substr(key, 2, dom_string_length(key),
 						      &sub) == DOM_NO_ERR) {
-					qjsky_register_event_listener_for(
-						thread->ctx, node, sub, false);
+					JSContext *ctx = thread_context(thread);
+					if (ctx != NULL) {
+						qjsky_register_event_listener_for(
+							ctx, node, sub, false);
+					}
 					dom_string_unref(sub);
 				}
 			}
@@ -1455,31 +1552,55 @@ out:
 /* exported interface documented in js.h */
 void js_event_cleanup(jsthread *thread, struct dom_event *evt)
 {
-	map_remove(thread->ctx, &thread->events, evt);
+	if (thread->ctx != NULL) {
+		map_remove(thread->ctx, &thread->events, evt);
+	}
 }
 
-/* exported interface documented in js.h */
-bool js_fire_event(jsthread *thread, const char *type, struct dom_document *doc,
-		   struct dom_node *target)
+/* a new event of a type (untrusted until dispatched by NetSurf), NULL
+ * without memory
+ */
+static dom_event *new_event(dom_string *type, bool bubbles, bool cancelable)
+{
+	dom_event *evt;
+
+	if (dom_event_create(&evt) != DOM_NO_ERR) {
+		return NULL;
+	}
+	if (dom_event_init(evt, type, bubbles, cancelable) != DOM_NO_ERR) {
+		dom_event_unref(evt);
+		return NULL;
+	}
+	return evt;
+}
+
+/* the Window's listeners for an event (it is not a node: libdom does not
+ * dispatch to it)
+ */
+static void window_listeners(JSContext *ctx, JSValueConst global, const char *type,
+			     dom_event *evt)
+{
+	JSValue event = qjsky_event(ctx, evt);
+	JSValue typev = JS_NewString(ctx, type);
+
+	if (!JS_IsException(event)) {
+		run_listeners(ctx, global, typev, event, false);
+	}
+	JS_FreeValue(ctx, typev);
+	JS_FreeValue(ctx, event);
+}
+
+/* load at the Window: its handler (else the body's), its listeners */
+static void fire_load(jsthread *thread, struct dom_document *doc)
 {
 	JSContext *ctx = thread->ctx;
-	dom_event *evt;
+	dom_event *evt = new_event(corestring_dom_load, false, false);
 	dom_event_target *body;
 	JSValue global, handler, event, ret;
 
-	/* only load, at the Window: its handler, else the body's */
-	if (target != NULL || strcmp(type, "load") != 0) {
-		return true;
+	if (evt == NULL) {
+		return;
 	}
-	if (dom_event_create(&evt) != DOM_NO_ERR) {
-		return true;
-	}
-	if (dom_event_init(evt, corestring_dom_load, false, false) != DOM_NO_ERR) {
-		dom_event_unref(evt);
-		return true;
-	}
-
-	thread->in_use++;
 	global = JS_GetGlobalObject(ctx);
 	handler = qjsky_get_event_handler(ctx, global, corestring_dom_load, NULL);
 	if (!JS_IsFunction(ctx, handler) &&
@@ -1494,17 +1615,74 @@ bool js_fire_event(jsthread *thread, const char *type, struct dom_document *doc,
 	if (JS_IsFunction(ctx, handler)) {
 		event = qjsky_event(ctx, evt);
 		if (!JS_IsException(event)) {
-			ret = qjsky_call(ctx, handler, global, 1,
-					 (JSValueConst *)&event);
+			ret = qjsky_call(ctx, handler, global, 1, (JSValueConst *)&event);
 			JS_FreeValue(ctx, ret);
 		}
 		JS_FreeValue(ctx, event);
 	}
 	JS_FreeValue(ctx, handler);
+	window_listeners(ctx, global, "load", evt);
 	JS_FreeValue(ctx, global);
 	js_event_cleanup(thread, evt);
 	dom_event_unref(evt);
+}
 
+/* DOMContentLoaded: at the Document (bubbling), then the Window's */
+static void fire_content_loaded(jsthread *thread, struct dom_document *doc)
+{
+	JSContext *ctx = thread->ctx;
+	dom_string *type;
+	dom_event *evt;
+	JSValue global;
+	bool success;
+
+	if (dom_string_create((const uint8_t *)"DOMContentLoaded", 16, &type) != DOM_NO_ERR) {
+		return;
+	}
+	evt = new_event(type, true, false);
+	dom_string_unref(type);
+	if (evt == NULL) {
+		return;
+	}
+	dom_event_target_dispatch_event((dom_event_target *)doc, evt, &success);
+	global = JS_GetGlobalObject(ctx);
+	window_listeners(ctx, global, "DOMContentLoaded", evt);
+	JS_FreeValue(ctx, global);
+	js_event_cleanup(thread, evt);
+	dom_event_unref(evt);
+}
+
+/* exported interface documented in js.h */
+bool js_fire_event(jsthread *thread, const char *type, struct dom_document *doc,
+		   struct dom_node *target)
+{
+	/** \todo events at other targets */
+	if (target != NULL || thread->pending_destroy) {
+		return true;
+	}
+	if (thread->ctx == NULL) {
+		/* no scripts have run: no handlers or listeners, but for
+		 * the body's onload attribute
+		 */
+		dom_html_element *body = NULL;
+		bool has = false;
+		if (strcmp(type, "load") != 0 ||
+		    dom_html_document_get_body(doc, &body) != DOM_NO_ERR ||
+		    body == NULL) {
+			return true;
+		}
+		dom_element_has_attribute(body, corestring_dom_onload, &has);
+		dom_node_unref(body);
+		if (!has || thread_context(thread) == NULL) {
+			return true;
+		}
+	}
+	thread->in_use++;
+	if (strcmp(type, "load") == 0) {
+		fire_load(thread, doc);
+	} else if (strcmp(type, "DOMContentLoaded") == 0) {
+		fire_content_loaded(thread, doc);
+	}
 	thread->in_use--;
 	if (thread->in_use == 0 && thread->pending_destroy) {
 		destroythread(thread);

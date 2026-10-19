@@ -172,6 +172,43 @@ method Document::createDocumentFragment()
 	return qjsky_node_result(ctx, err, (dom_node *)frag);
 %}
 
+getter Document::readyState()
+%{
+	/* loading until the parse is done, interactive until loaded */
+	struct html_content *htmlc = document_htmlc(priv->parent.node);
+	const char *state = "complete";
+
+	if (htmlc != NULL) {
+		if (!htmlc->conversion_begun) {
+			state = "loading";
+		} else if (htmlc->base.status != CONTENT_STATUS_DONE) {
+			state = "interactive";
+		}
+	}
+	return JS_NewString(ctx, state);
+%}
+
+getter Document::defaultView()
+%{
+	(void)priv;
+	return JS_GetGlobalObject(ctx);
+%}
+
+method Document::createComment()
+%{
+	dom_node *comment = NULL;
+	dom_exception err;
+	dom_string *data = document_string_arg(ctx, argv[0]);
+
+	if (data == NULL) {
+		return JS_EXCEPTION;
+	}
+	err = dom_document_create_comment(priv->parent.node, data,
+					  (dom_comment **)&comment);
+	dom_string_unref(data);
+	return qjsky_node_result(ctx, err, comment);
+%}
+
 getter Document::head()
 %{
 	return document_first_by_tag(ctx, priv->parent.node, corestring_dom_HEAD);

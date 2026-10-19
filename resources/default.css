@@ -8,6 +8,9 @@ html { display: block; }
 
 head { display: none; }
 
+/* the hidden attribute (the HTML standard's rendering section) */
+[hidden] { display: none; }
+
 body { display: block; margin: 8px; line-height: 1.33; }
 
 div { display: block; }
