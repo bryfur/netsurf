@@ -300,19 +300,38 @@ DOMSettableTokenList.prototype.toString = DOMTokenList.prototype.toString;
 	return out;
     });
 
-    /* Web Storage: this page's, in memory */
+    /* Web Storage: this page's, in memory, at most QUOTA characters (keys
+     * and values; browsers allow ~5 MB an origin, this machine less):
+     * QuotaExceededError past it, which sites expect and handle
+     */
+    var QUOTA = 512 * 1024;
     function Storage() {}
     Storage.prototype = {
 	getItem: function (k) { k = String(k); return Object.prototype.hasOwnProperty.call(this._d, k) ? this._d[k] : null; },
-	setItem: function (k, v) { this._d[String(k)] = String(v); },
-	removeItem: function (k) { delete this._d[String(k)]; },
-	clear: function () { this._d = Object.create(null); },
+	setItem: function (k, v) {
+	    k = String(k); v = String(v);
+	    var old = Object.prototype.hasOwnProperty.call(this._d, k) ? k.length + this._d[k].length : 0;
+	    if (this._n - old + k.length + v.length > QUOTA) {
+		throw new DOMException("the storage quota is exceeded", "QuotaExceededError");
+	    }
+	    this._n += k.length + v.length - old;
+	    this._d[k] = v;
+	},
+	removeItem: function (k) {
+	    k = String(k);
+	    if (Object.prototype.hasOwnProperty.call(this._d, k)) {
+		this._n -= k.length + this._d[k].length;
+		delete this._d[k];
+	    }
+	},
+	clear: function () { this._d = Object.create(null); this._n = 0; },
 	key: function (i) { var k = Object.keys(this._d); return i < k.length ? k[i] : null; },
 	get length() { return Object.keys(this._d).length; }
     };
     function makeStorage() {
 	var s = new Storage();
 	Object.defineProperty(s, "_d", { value: Object.create(null), writable: true });
+	Object.defineProperty(s, "_n", { value: 0, writable: true });
 	return new Proxy(s, {
 	    get: function (t, k) { return (k in t || typeof k !== "string") ? t[k] : t.getItem(k) === null ? undefined : t.getItem(k); },
 	    set: function (t, k, v) { if (k in t) t[k] = v; else t.setItem(k, v); return true; },
@@ -377,6 +396,29 @@ DOMSettableTokenList.prototype.toString = DOMTokenList.prototype.toString;
 	method(CSSStyleDeclaration.prototype, "removeProperty", function (n) { var k = camel(String(n)), v = this[k]; delete this[k]; return v === undefined ? "" : v; });
     }
     var t0 = Date.now();
+    /* performance: the clock (QuickJS-ng's own performance.now, or ours);
+     * no entries are recorded (marks and measures are taken and kept
+     * nowhere), PerformanceObserver supports no type
+     */
+    function noEntries() { return []; }
     fallback("performance", { now: function () { return Date.now() - t0; }, timeOrigin: t0 });
+    var perf = g.performance, nop = function () {};
+    [["mark", nop], ["measure", nop], ["clearMarks", nop], ["clearMeasures", nop],
+     ["clearResourceTimings", nop], ["getEntries", noEntries], ["getEntriesByName", noEntries],
+     ["getEntriesByType", noEntries],
+     ["toJSON", function () { return { timeOrigin: perf.timeOrigin }; }]].forEach(function (m) {
+	if (typeof perf[m[0]] !== "function") {
+	    Object.defineProperty(perf, m[0], { value: m[1], writable: true, configurable: true });
+	}
+    });
+    function PerformanceObserver(callback) {
+	if (!new.target) throw new TypeError("PerformanceObserver: use new");
+	if (typeof callback !== "function") throw new TypeError("PerformanceObserver: not a function");
+    }
+    PerformanceObserver.prototype.observe = function () {};
+    PerformanceObserver.prototype.disconnect = function () {};
+    PerformanceObserver.prototype.takeRecords = noEntries;
+    Object.defineProperty(PerformanceObserver, "supportedEntryTypes", { value: Object.freeze([]) });
+    fallback("PerformanceObserver", PerformanceObserver);
     fallback("queueMicrotask", function (f) { Promise.resolve().then(f); });
 })();

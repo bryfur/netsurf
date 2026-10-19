@@ -72,6 +72,13 @@
 #define NETSURF_JS_STACK (48 * 1024)
 #endif
 
+/* the most memory a window's scripts may have (KB): past it they get
+ * "out of memory", not the machine
+ */
+#ifndef NETSURF_JS_MEMORY
+#define NETSURF_JS_MEMORY 12288
+#endif
+
 /* the modules made on demand (below) */
 enum { MODULE_SELECTORS, MODULE_NET, MODULE_DOMEXCEPTION, MODULE_COUNT };
 static JSValue module_exports(JSContext *ctx, int m);
@@ -1972,6 +1979,7 @@ static JSRuntime *heap_runtime(jsheap *heap)
 	}
 	JS_SetRuntimeOpaque(heap->rt, heap);
 	JS_SetMaxStackSize(heap->rt, NETSURF_JS_STACK);
+	JS_SetMemoryLimit(heap->rt, (size_t)NETSURF_JS_MEMORY * 1024);
 	JS_SetInterruptHandler(heap->rt, interrupt_handler, heap);
 	JS_SetHostPromiseRejectionTracker(heap->rt, rejection_tracker, heap);
 	if (qjsky_runtime_init(heap->rt) < 0) {
