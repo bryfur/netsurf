@@ -76,7 +76,7 @@
  * "out of memory", not the machine
  */
 #ifndef NETSURF_JS_MEMORY
-#define NETSURF_JS_MEMORY 12288
+#define NETSURF_JS_MEMORY 8192
 #endif
 
 /* the modules made on demand (below) */
