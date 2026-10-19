@@ -55,6 +55,8 @@
 #include "quickjs/prototype.h"
 #include "quickjs/generics.js.inc"
 #include "quickjs/polyfill.js.inc"
+#include "quickjs/selectors.js.inc"
+#include "quickjs/net.js.inc"
 
 #include "qjsky.h"
 
@@ -108,6 +110,7 @@ struct jsthread {
 	struct qjsky_map events;
 	struct js_fetch *fetches; /* the page's script fetches under way */
 	JSValue rejections; /* promises rejected without a handler (an array) */
+	JSValue modules[2]; /* the on-demand modules' exports (JS_UNDEFINED until used) */
 	int next_fetch_id;
 	JSValue classes[2 * QJSKY_CLASS_COUNT];
 };
@@ -1749,12 +1752,161 @@ static JSValue js_utf8encode(JSContext *ctx, JSValueConst this_val, int argc,
 	return arr;
 }
 
+/* what net.js gets (its argument: never on the global) */
 static const JSCFunctionListEntry js_natives[] = {
-	JS_CFUNC_DEF("__nsfetch", 5, js_nsfetch),
-	JS_CFUNC_DEF("__nsfetch_abort", 1, js_nsfetch_abort),
-	JS_CFUNC_DEF("__nsutf8decode", 1, js_utf8decode),
-	JS_CFUNC_DEF("__nsutf8encode", 1, js_utf8encode),
+	JS_CFUNC_DEF("fetch", 5, js_nsfetch),
+	JS_CFUNC_DEF("abort", 1, js_nsfetch_abort),
+	JS_CFUNC_DEF("utf8decode", 1, js_utf8decode),
+	JS_CFUNC_DEF("utf8encode", 1, js_utf8encode),
 };
+
+/*** modules on demand: JavaScript a page pays for when it first names one
+ * of its exports (a lazy property of the global or a prototype)
+ ***/
+
+enum { MODULE_SELECTORS, MODULE_NET, MODULE_COUNT };
+
+static const struct {
+	const char *name;
+	const unsigned char *src;
+	const unsigned int *len;
+	bool natives;	/* called with the natives */
+} modules[MODULE_COUNT] = {
+	[MODULE_SELECTORS] = { "selectors.js", selectors_js, &selectors_js_len, false },
+	[MODULE_NET] = { "net.js", net_js, &net_js_len, true },
+};
+
+/* a module's exports (made the first time: its source evaluated, the
+ * function it is called): a new reference, or JS_EXCEPTION
+ */
+static void mem_report(JSRuntime *rt, const char *stage);
+
+static JSValue module_exports(JSContext *ctx, int m)
+{
+	jsthread *thread = thread_of(ctx);
+	JSValue fn, arg = JS_UNDEFINED, exports;
+	char *buf;
+
+	if (!JS_IsUndefined(thread->modules[m])) {
+		return JS_DupValue(ctx, thread->modules[m]);
+	}
+	buf = malloc(*modules[m].len + 1);
+	if (buf == NULL) {
+		return JS_ThrowOutOfMemory(ctx);
+	}
+	memcpy(buf, modules[m].src, *modules[m].len);
+	buf[*modules[m].len] = 0;
+	fn = JS_Eval(ctx, buf, *modules[m].len, modules[m].name, JS_EVAL_TYPE_GLOBAL);
+	free(buf);
+	if (JS_IsException(fn)) {
+		return fn;
+	}
+	if (modules[m].natives) {
+		arg = JS_NewObject(ctx);
+		JS_SetPropertyFunctionList(ctx, arg, js_natives,
+					   sizeof(js_natives) / sizeof(js_natives[0]));
+	}
+	exports = JS_Call(ctx, fn, JS_UNDEFINED, modules[m].natives ? 1 : 0,
+			  (JSValueConst *)&arg);
+	JS_FreeValue(ctx, arg);
+	JS_FreeValue(ctx, fn);
+	if (JS_IsException(exports)) {
+		return exports;
+	}
+	thread->modules[m] = JS_DupValue(ctx, exports);
+	mem_report(JS_GetRuntime(ctx), modules[m].name);
+	return exports;
+}
+
+/* a lazy property's value: the export of its name (opaque: the module) */
+static JSValue module_export(JSContext *ctx, const JSCFunctionListEntry *e)
+{
+	JSValue exports = module_exports(ctx, (int)(intptr_t)e->u.lazy.opaque);
+	JSValue v;
+
+	if (JS_IsException(exports)) {
+		return exports;
+	}
+	v = JS_GetPropertyStr(ctx, exports, e->name);
+	JS_FreeValue(ctx, exports);
+	return v;
+}
+
+#define MODULE_ATTRS (JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+#define METHOD_ATTRS (JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE)
+#define NET(n) JS_LAZY_DEF(n, module_export, (void *)(intptr_t)MODULE_NET, MODULE_ATTRS)
+#define SEL(n) JS_LAZY_DEF(n, module_export, (void *)(intptr_t)MODULE_SELECTORS, METHOD_ATTRS)
+
+static const JSCFunctionListEntry net_globals[] = {
+	NET("XMLHttpRequest"), NET("fetch"), NET("Headers"), NET("Request"),
+	NET("Response"), NET("AbortController"), NET("AbortSignal"),
+	NET("TextEncoder"), NET("TextDecoder"), NET("URLSearchParams"),
+};
+
+static const JSCFunctionListEntry element_selectors[] = {
+	SEL("querySelector"), SEL("querySelectorAll"), SEL("getElementsByClassName"),
+	SEL("matches"), SEL("webkitMatchesSelector"), SEL("closest"),
+};
+
+static const JSCFunctionListEntry parent_selectors[] = {
+	SEL("querySelector"), SEL("querySelectorAll"), SEL("getElementsByClassName"),
+};
+
+/* lazy entries defined on obj, replacing what it has of those names (the
+ * IDL's unimplemented interfaces: URLSearchParams); QuickJS refuses an
+ * autoinit property over an existing one
+ */
+static int define_lazy(JSContext *ctx, JSValueConst obj,
+		       const JSCFunctionListEntry *list, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		JSAtom atom = JS_NewAtom(ctx, list[i].name);
+		int has = JS_GetOwnProperty(ctx, NULL, obj, atom);
+		if (has > 0) {
+			JS_DeleteProperty(ctx, obj, atom, 0);
+		}
+		JS_FreeAtom(ctx, atom);
+		if (has < 0 || JS_SetPropertyFunctionList(ctx, obj, list + i, 1) < 0) {
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* the modules' exports as lazy properties of the global and the prototypes */
+static int modules_define(JSContext *ctx, JSValueConst global)
+{
+	static const struct {
+		const qjsky_class_t *klass;
+		const JSCFunctionListEntry *list;
+		int n;
+	} protos[] = {
+		{ &qjsky_class_element, element_selectors, 6 },
+		{ &qjsky_class_document, parent_selectors, 3 },
+		{ &qjsky_class_document_fragment, parent_selectors, 3 },
+	};
+	size_t i;
+
+	if (define_lazy(ctx, global, net_globals,
+			sizeof(net_globals) / sizeof(net_globals[0])) < 0) {
+		return -1;
+	}
+	for (i = 0; i < sizeof(protos) / sizeof(protos[0]); i++) {
+		JSValue proto = qjsky_proto(ctx, protos[i].klass);
+		int r;
+		if (JS_IsException(proto)) {
+			return -1;
+		}
+		r = define_lazy(ctx, proto, protos[i].list, protos[i].n);
+		JS_FreeValue(ctx, proto);
+		if (r < 0) {
+			return -1;
+		}
+	}
+	return 0;
+}
 
 /*** the engine's interface (js.h) ***/
 
@@ -1896,6 +2048,9 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv, jsthread **th
 	ret->doc_priv = doc_priv;
 	ret->generics = JS_UNDEFINED;
 	ret->rejections = JS_UNDEFINED;
+	for (i = 0; i < MODULE_COUNT; i++) {
+		ret->modules[i] = JS_UNDEFINED;
+	}
 	for (i = 0; i < 2 * QJSKY_CLASS_COUNT; i++) {
 		ret->classes[i] = JS_UNDEFINED;
 	}
@@ -1956,11 +2111,13 @@ static JSContext *thread_context(jsthread *thread)
 	}
 	mem_report(rt, "window");
 
-	/* the polyfills (which take the natives off the global), then
-	 * NetSurf's generics (taken off the global)
+	/* the modules' exports (lazily), the polyfills, then NetSurf's
+	 * generics (taken off the global)
 	 */
-	JS_SetPropertyFunctionList(ctx, global, js_natives,
-				   sizeof(js_natives) / sizeof(js_natives[0]));
+	if (modules_define(ctx, global) < 0) {
+		JS_FreeValue(ctx, global);
+		goto fail;
+	}
 	if (run_internal(ctx, polyfill_js, polyfill_js_len, "polyfill.js") < 0 ||
 	    run_internal(ctx, generics_js, generics_js_len, "generics.js") < 0) {
 		JS_FreeValue(ctx, global);
@@ -2021,6 +2178,10 @@ static void destroythread(jsthread *thread)
 	JS_FreeValue(ctx, thread->generics);
 	JS_FreeValue(ctx, thread->rejections);
 	thread->rejections = JS_UNDEFINED;
+	for (i = 0; i < MODULE_COUNT; i++) {
+		JS_FreeValue(ctx, thread->modules[i]);
+		thread->modules[i] = JS_UNDEFINED;
+	}
 	for (i = 0; i < 2 * QJSKY_CLASS_COUNT; i++) {
 		JS_FreeValue(ctx, thread->classes[i]);
 		thread->classes[i] = JS_UNDEFINED;
