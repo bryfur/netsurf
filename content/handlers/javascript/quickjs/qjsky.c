@@ -2426,6 +2426,14 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv, jsthread **th
 /* exported interface documented in qjsky.h */
 qjsky_native_hook_t qjsky_native_hook;
 
+/* exported interface documented in qjsky.h */
+void *qjsky_window_priv(JSContext *ctx)
+{
+	jsthread *thread = thread_of(ctx);
+
+	return thread != NULL ? thread->win_priv : NULL;
+}
+
 /* a page's context, made the first time (the Window, the polyfills): NULL
  * if it cannot be
  */

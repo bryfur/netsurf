@@ -71,6 +71,7 @@ void ns_system_colour_finalize(void)
 	for (ccount = 0; ccount < colour_list_len; ccount++) {
 		lwc_string_unref(colour_list[ccount]);
 	}
+	ns_system_colour_pw = NULL;
 }
 
 
