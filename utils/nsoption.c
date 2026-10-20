@@ -82,6 +82,8 @@ static struct nsoption_s defaults[] = {
 #include "windows/options.h"
 #elif defined(nsqt)
 #include "qt/options.h"
+#elif defined(nsfpc)
+#include "nsfpc_options.h"
 #endif
 	{ NULL, 0, OPTION_INTEGER, { 0 } }
 };
